@@ -1,0 +1,17 @@
+{"axis":"code","docs":["docs/architecture.md#crate-tree"],"id":"Cargo.toml","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"workspace","path":"Cargo.toml","syncStatus":"ok"}
+{"axis":"code","docs":["docs/architecture.md#crate-tree"],"id":"crates/ccync-foundation","kind":"dir","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"foundation","path":"crates/ccync-foundation","syncStatus":"ok"}
+{"axis":"code","docs":["docs/architecture.md#crate-tree"],"id":"crates/mcp","kind":"dir","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"projection","path":"crates/mcp","syncStatus":"ok"}
+{"axis":"code","docs":["docs/architecture.md#crate-tree","docs/devguide.md#projection-engine"],"id":"crates/projection","kind":"dir","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"projection","path":"crates/projection","syncStatus":"ok"}
+{"axis":"code","docs":["docs/architecture.md#crate-tree","docs/devguide.md#catalog--lockfile--cache"],"id":"crates/ccync-engine","kind":"dir","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"engine","path":"crates/ccync-engine","syncStatus":"ok"}
+{"axis":"code","docs":["docs/architecture.md#crate-tree"],"id":"crates/setup","kind":"dir","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"setup","path":"crates/setup","syncStatus":"ok"}
+{"axis":"code","docs":["docs/architecture.md#crate-tree","docs/manual.md"],"id":"crates/ccync-cli","kind":"dir","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"cli","path":"crates/ccync-cli","syncStatus":"ok"}
+{"axis":"code","docs":["docs/architecture.md#decisions","docs/research/gal-domain-bundles-deferred.md"],"id":"plugins/catalog.json","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"source-contracts","path":"plugins/catalog.json","syncStatus":"ok"}
+{"axis":"doc","docs":[],"id":"README.md","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"documentation","path":"README.md","syncStatus":"ok"}
+{"axis":"doc","docs":[],"id":"docs/architecture.md","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"documentation","path":"docs/architecture.md","syncStatus":"ok"}
+{"axis":"doc","docs":[],"id":"docs/manual.md","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"documentation","path":"docs/manual.md","syncStatus":"ok"}
+{"axis":"doc","docs":[],"id":"docs/devguide.md","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"documentation","path":"docs/devguide.md","syncStatus":"ok"}
+{"axis":"doc","docs":[],"id":"docs/naming.md","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"documentation","path":"docs/naming.md","syncStatus":"ok"}
+{"axis":"doc","docs":[],"id":"docs/contributing.md","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"documentation","path":"docs/contributing.md","syncStatus":"ok"}
+{"axis":"doc","docs":[],"id":"docs/i18n/guide.md","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"documentation","path":"docs/i18n/guide.md","syncStatus":"ok"}
+{"axis":"doc","docs":[],"id":"docs/research/curated-upstream-prerelease-decision.md","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"documentation","path":"docs/research/curated-upstream-prerelease-decision.md","syncStatus":"ok"}
+{"axis":"doc","docs":[],"id":"docs/research/gal-domain-bundles-deferred.md","kind":"file","lastSynced":"2026-06-23","lastSyncedRef":null,"layer":"documentation","path":"docs/research/gal-domain-bundles-deferred.md","syncStatus":"ok"}
