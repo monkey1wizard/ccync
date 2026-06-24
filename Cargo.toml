@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/ccync-foundation", "crates/mcp", "crates/ccync-cli", "crates/ccync-engine", "crates/projection", "crates/setup"]
+resolver = "2"

@@ -1,0 +1,60 @@
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+.venv/
+
+# Local workflow state.
+# Track durable, repo-visible execution memory (file-memory contract); ignore the rest.
+.dev/*
+!.dev/project.md
+!.dev/state.md
+!.dev/release-private.md
+!.dev/plans/
+.dev/plans/*
+!.dev/plans/*.prompt.md
+# Transient pipeline receipts (dispatch write-back verification); covered by .dev/* but anchored for intent.
+.dev/pipeline/
+
+# Private notes (never commit — local-only)
+*.private.md
+
+# Secrets (never commit these)
+*.key
+*.pem
+openclaw.json
+
+# Local overrides (fork and customize)
+# Keep machine-specific files out of source control.
+# Example: commit config.example.env, ignore config.local.env.
+config.local.env
+config.json
+mcp.local.json
+xmachine.config.json
+commands/*/SKILL.local.md
+
+# Baked command skills — derived from SKILL.template.md by `ccync sync`.
+# Regenerable per-machine; do not track. Authored skills under skills/*/SKILL.md stay tracked.
+commands/*/SKILL.md
+
+# Local temporary outputs, caches, and sandboxes
+.tmp/
+
+# graphify knowledge-graph outputs (tool default root dir)
+graphify-out/
+
+# Generated provider plugin artifacts
+dist/
+
+# Rust build output
+/target/
+**/target/
+
+# Release scratch
+/release-scratch/

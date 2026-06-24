@@ -1,0 +1,23 @@
+[package]
+name = "ccync-foundation"
+version = "0.1.0"
+edition = "2021"
+description = "ccync foundation crate — paths, config, ledger, mode, platform, secret, json/mcp models. Depends on no other ccync crate."
+license = "MIT"
+repository = "https://gitlab.com/monkey1wizard/ccync"
+
+[lib]
+name = "ccync_foundation"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+thiserror = "2.0"
+chrono = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
+regex = "1.0"
+
+[dev-dependencies]
+tempfile = "3.0"

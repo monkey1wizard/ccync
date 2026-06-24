@@ -1,0 +1,24 @@
+[package]
+name = "setup"
+version = "0.1.0"
+edition = "2021"
+description = "ccync machine-setup orchestrator — runtime selection + interactive session seam (reused by `ccync init`) + health checks. Orchestrate-only: sequences projection + mcp library calls."
+license = "MIT"
+repository = "https://gitlab.com/monkey1wizard/ccync"
+
+[lib]
+name = "setup"
+path = "src/lib.rs"
+
+[dependencies]
+ccync-foundation = { path = "../ccync-foundation" }
+projection = { path = "../projection" }
+ccync-engine = { path = "../ccync-engine" }
+mcp = { path = "../mcp" }
+serde_json = "1.0"
+toml = { version = "0.8", features = ["parse"] }
+chrono = "0.4"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.0"
