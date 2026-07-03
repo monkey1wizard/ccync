@@ -1,0 +1,19 @@
+[package]
+name = "setup"
+version = "0.1.0"
+edition = "2021"
+description = "ccync machine-setup health checks, aggregated into `ccync doctor`."
+license = "MIT"
+repository = "https://gitlab.com/monkey1wizard/ccync"
+
+[lib]
+name = "setup"
+path = "src/lib.rs"
+
+[dependencies]
+ccync-foundation = { path = "../ccync-foundation" }
+serde_json = "1.0"
+toml = { version = "0.8", features = ["parse"] }
+
+[dev-dependencies]
+tempfile = "3.0"

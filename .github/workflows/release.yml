@@ -1,0 +1,254 @@
+# ccync Release Workflow
+#
+# Trigger: push of a version tag (v*).
+# Produces: cross-platform `ccync` binaries + binary-only archives, checksums.txt,
+#   artifact-manifest.json, winget + homebrew manifests, and a cosign keyless
+#   signature over checksums.txt.
+#
+# This pipeline is ccync-exclusive and shares nothing with any other product's
+# release: its own crate (`-p ccync-cli`), binary (`ccync`), asset names
+# (`ccync-*`), package ids, tap formula (`ccync.rb`), and cosign identity.
+#
+# Cosign trust setup:
+#   - Signing uses sigstore/cosign keyless (GitHub Actions OIDC, no long-term key).
+#   - `id-token: write` is the minimum OIDC permission required; it is scoped
+#     to the `sign` job only. The build matrix jobs have no OIDC access.
+#   - Verification (offline):
+#       cosign verify-blob checksums.txt \
+#         --signature checksums.txt.sig \
+#         --certificate checksums.txt.pem \
+#         --certificate-identity-regexp '^https://github\.com/monkey1wizard/ccync/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+' \
+#         --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#
+# Security note: this workflow is the cosign CI trust surface. Review this file
+# before the first package-manager publication per the security review gate.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+# Restrict default permissions to read-only; elevate only where needed.
+permissions:
+  contents: write   # create GitHub Release and upload assets
+  id-token: none    # elevated to 'write' in the sign job only
+
+jobs:
+  # ── Build matrix ─────────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            platform: windows
+            arch: x64
+            binary_ext: .exe
+            archive_ext: .zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            platform: windows
+            arch: arm64
+            binary_ext: .exe
+            archive_ext: .zip
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            platform: darwin
+            arch: x64
+            binary_ext: ""
+            archive_ext: .tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            platform: darwin
+            arch: arm64
+            binary_ext: ""
+            archive_ext: .tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            platform: linux
+            arch: x64
+            binary_ext: ""
+            archive_ext: .tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            platform: linux
+            arch: arm64
+            binary_ext: ""
+            archive_ext: .tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (musl targets)
+        if: contains(matrix.target, 'musl')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build binary (native)
+        if: "!contains(matrix.target, 'musl')"
+        run: cargo build --release --target ${{ matrix.target }} -p ccync-cli
+
+      - name: Build binary (cross/musl)
+        if: contains(matrix.target, 'musl')
+        run: cross build --release --target ${{ matrix.target }} -p ccync-cli
+
+      - name: Prepare canonical asset names
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          BINARY_NAME="ccync-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.binary_ext }}"
+          ARCHIVE_NAME="ccync-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.archive_ext }}"
+          echo "BINARY_NAME=${BINARY_NAME}" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Copy and rename standalone binary asset
+        shell: bash
+        run: |
+          SRC="target/${{ matrix.target }}/release/ccync${{ matrix.binary_ext }}"
+          cp "${SRC}" "${BINARY_NAME}"
+
+      # ccync ships a SINGLE self-contained binary. It bakes its catalog into the
+      # binary (embedded_catalog_json) and renders its canonical root at runtime
+      # from cloned/added plugins — it does NOT need a packaged source tree (unlike
+      # source-root-resolving CLIs). So the end-user archive is binary-only:
+      # the `ccync` binary plus LICENSE, nothing else.
+      - name: Stage end-user package (binary-only)
+        shell: bash
+        run: |
+          rm -rf pkg && mkdir -p pkg
+          cp "${BINARY_NAME}" "pkg/ccync${{ matrix.binary_ext }}"
+          cp LICENSE pkg/
+
+      - name: Create package archive (zip — Windows)
+        if: matrix.archive_ext == '.zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "pkg/*" -DestinationPath $env:ARCHIVE_NAME
+
+      - name: Create package archive (tar.gz — Unix)
+        if: matrix.archive_ext == '.tar.gz'
+        shell: bash
+        run: |
+          tar -czf "${ARCHIVE_NAME}" -C pkg .
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ env.BINARY_NAME }}
+          if-no-files-found: error
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ env.ARCHIVE_NAME }}
+          if-no-files-found: error
+
+  # ── Assemble + sign ───────────────────────────────────────────────────────
+  sign:
+    name: Assemble, sign, and publish
+    needs: build
+    runs-on: ubuntu-latest
+    # OIDC permission scoped to this job only (cosign trust surface).
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets/
+
+      - name: Flatten asset directory
+        shell: bash
+        run: |
+          find assets/ -type f \( -name "*.exe" -o -name "*.zip" -o -name "*.tar.gz" -o ! -name "*.*" \) \
+            -exec mv {} ./  \;
+
+      # Generate checksums.txt, artifact-manifest.json, and the winget + homebrew
+      # manifests from the canonical assets. ccync has NO `release` CLI verb (the
+      # 9-verb public surface is frozen), so this is a self-contained POSIX script
+      # — no dependency on the binary, no shared tooling with any other product.
+      - name: Generate checksums + package-manager manifests
+        shell: bash
+        run: |
+          bash packaging/gen-release-artifacts.sh \
+            --version "${{ github.ref_name }}" \
+            --assets-dir . \
+            --output-dir release-out
+          cp release-out/checksums.txt ./checksums.txt
+          cp release-out/artifact-manifest.json ./artifact-manifest.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums.txt (cosign keyless — GitHub Actions OIDC)
+        # Produces checksums.txt.sig + checksums.txt.pem (certificate) in Rekor.
+        run: |
+          cosign sign-blob checksums.txt \
+            --yes \
+            --output-signature checksums.txt.sig \
+            --output-certificate checksums.txt.pem
+
+      - name: Push Homebrew formula to tap
+        # Requires a repo-scoped HOMEBREW_TAP_TOKEN with write access to the
+        # homebrew-tap repository (minimum: contents:write), added as a repository
+        # secret named HOMEBREW_TAP_TOKEN. The ccync formula (ccync.rb) is a
+        # distinct file in the tap — it never shares a formula with any other tool.
+        # winget manifest PR submission is handled manually for v1; automate later.
+        # Prerelease tags (containing '-', e.g. v0.1.0-rc4) must not update the
+        # public tap; only stable semver tags (no '-') push ccync.rb.
+        if: "env.HOMEBREW_TAP_TOKEN != '' && !contains(github.ref_name, '-')"
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/monkey1wizard/homebrew-tap.git" \
+            homebrew-tap
+          mkdir -p homebrew-tap/Formula
+          cp release-out/ccync.rb homebrew-tap/Formula/ccync.rb
+          cd homebrew-tap
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/ccync.rb
+          git diff --cached --quiet && exit 0  # nothing changed
+          git commit -m "chore(formula): update ccync to ${VERSION}"
+          git push
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ccync ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            ccync-*
+            checksums.txt
+            checksums.txt.sig
+            checksums.txt.pem
+            artifact-manifest.json
+            packaging/install.sh
+            packaging/install.ps1

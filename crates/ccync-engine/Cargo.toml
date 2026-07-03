@@ -1,0 +1,29 @@
+[package]
+name = "ccync-engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ccync_engine"
+path = "src/lib.rs"
+
+[dependencies]
+ccync-foundation = { path = "../ccync-foundation" }
+projection = { path = "../projection" }
+mcp = { path = "../mcp" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = { version = "0.8", features = ["parse"] }
+dirs = "5.0"
+thiserror = "2.0"
+uuid = { version = "1.0", features = ["v4"] }
+chrono = "0.4"
+regex = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+zip = "2.1"
+flate2 = "1.0"
+tar = "0.4"
+
+[dev-dependencies]
+tempfile = "3.0"
