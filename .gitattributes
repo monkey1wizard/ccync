@@ -1,0 +1,8 @@
+# ccync — Git attributes
+# Smudge/clean filter for personalizable adapter files.
+# Registered locally via: git config filter.ccync-config.smudge/clean
+
+AGENTS.md                                              filter=ccync-config
+CLAUDE.md                                              filter=ccync-config
+GEMINI.md                                              filter=ccync-config
+.github/copilot-instructions.md                        filter=ccync-config
