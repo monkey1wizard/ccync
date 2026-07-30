@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-06-23",
+  "plugins": [],
+  "profiles": {
+    "default": {
+      "description": "Minimum install: nothing. ccync is a plugin manager — all plugins are opt-in via `ccync add <link>`.",
+      "plugins": []
+    }
+  }
+}
