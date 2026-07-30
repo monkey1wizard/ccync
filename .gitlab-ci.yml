@@ -1,0 +1,47 @@
+stages:
+  - publish
+
+publish-public-release:
+  stage: publish
+  image: alpine:3.20
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$/'
+  before_script:
+    - apk add --no-cache git bash grep findutils coreutils tar
+  script:
+    - |
+      set -euo pipefail
+
+      if [ -z "${GITHUB_PUSH_TOKEN:-}" ]; then
+        echo "publish-public-release: GITHUB_PUSH_TOKEN is empty — refusing to publish." >&2
+        exit 1
+      fi
+
+      TAG="${CI_COMMIT_TAG}"
+      TAG_VERSION="$(printf '%s' "$TAG" | sed -E 's/^v//; s/-rc[0-9]+$//')"
+      CRATE_VERSION="$(grep -m1 '^version' crates/ccync-cli/Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+
+      if [ "$TAG_VERSION" != "$CRATE_VERSION" ]; then
+        echo "publish-public-release: tag '${TAG}' (version ${TAG_VERSION}) does not match crates/ccync-cli/Cargo.toml version (${CRATE_VERSION})." >&2
+        exit 1
+      fi
+
+      GITHUB_REPO_PATH="monkey1wizard/ccync"
+      GITHUB_AUTH_URL="https://x-access-token:${GITHUB_PUSH_TOKEN}@github.com/${GITHUB_REPO_PATH}.git"
+
+      if git remote | grep -qx github; then
+        git remote set-url github "$GITHUB_AUTH_URL"
+      else
+        git remote add github "$GITHUB_AUTH_URL"
+      fi
+
+      if git ls-remote --tags github "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}\$"; then
+        echo "publish-public-release: tag '${TAG}' already exists on the public repository — aborting." >&2
+        exit 1
+      fi
+
+      echo "publish-public-release: dry run ..."
+      bash packaging/publish-public.sh --remote github --branch main
+
+      echo "publish-public-release: executing publish ..."
+      bash packaging/publish-public.sh --remote github --branch main --execute --tag "${TAG}"
