@@ -1,0 +1,1 @@
+[{"path":"/global/demo","dependencies":{"demo":{"version":"1.2.3","bin":{"demo":"dist/cli.js"}}}},{"path":"/global/other","dependencies":{"demo":{"version":"2.0.0","bin":{"demo":"other.js"}}}}]

@@ -1,0 +1,1 @@
+{"casks":[{"token":"demo-wrap","full_token":"homebrew/cask/demo-wrap","tap":"homebrew/cask","version":"1.2.0","artifacts":[{"command_wrapper":{"source":"source/wrapper","target":"bin/wrapper"}}]}]}

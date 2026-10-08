@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-linux:
+    name: Ubuntu tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Configure disposable runner Git identity
+        shell: bash
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test workspace
+        shell: bash
+        run: cargo test --workspace --locked -- --exact $(awk -v os=linux '$1==os {printf " --skip %s", $2}' .github/ci-deferred-tests.txt)
+      - name: Lint workspace
+        run: cargo clippy --workspace --locked
+      - name: Run release-note probes
+        shell: bash
+        run: |
+          if [[ -f .github/workflows/publish-public.yml ]]; then
+            bash packaging/test-release-notes.sh
+          else
+            bash packaging/test-release-notes.sh --public-snapshot
+          fi
+      - name: Run packaging probes
+        shell: bash
+        run: |
+          if [[ -f packaging/test-release-artifacts.sh ]]; then
+            bash packaging/test-release-artifacts.sh
+          fi
+          if [[ -f packaging/test-publish-public.sh ]]; then
+            bash packaging/test-publish-public.sh
+          fi
+
+  test-windows:
+    name: Windows tests
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Configure disposable runner Git identity
+        shell: bash
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test workspace
+        shell: bash
+        run: cargo test --workspace --locked -- --exact $(awk -v os=windows '$1==os {printf " --skip %s", $2}' .github/ci-deferred-tests.txt)
+      - name: Lint workspace
+        run: cargo clippy --workspace --locked
+      - name: Run PowerShell installer probes
+        shell: pwsh
+        run: ./packaging/test-install.ps1

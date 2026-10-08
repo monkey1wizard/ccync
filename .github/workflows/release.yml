@@ -1,0 +1,588 @@
+# ccync Release Workflow
+#
+# Trigger: push of a version tag (v*).
+# Produces: cross-platform `ccync` binaries + binary-only archives, checksums.txt,
+#   artifact-manifest.json, winget + homebrew manifests, and a cosign keyless
+#   signature over checksums.txt.
+#
+# This pipeline is ccync-exclusive and shares nothing with any other product's
+# release: its own crate (`-p ccync-cli`), binary (`ccync`), asset names
+# (`ccync-*`), package ids, tap formula (`ccync.rb`), and cosign identity.
+#
+# Cosign trust setup:
+#   - Signing uses sigstore/cosign keyless (GitHub Actions OIDC, no long-term key).
+#   - `id-token: write` is the minimum OIDC permission required; it is scoped
+#     to the `sign` job only. The build matrix jobs have no OIDC access.
+#   - Verification (offline):
+#       cosign verify-blob checksums.txt \
+#         --signature checksums.txt.sig \
+#         --certificate checksums.txt.pem \
+#         --certificate-identity-regexp '^https://github\.com/monkey1wizard/ccync/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+' \
+#         --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#
+# Security note: this workflow is the cosign CI trust surface. Review this file
+# before the first package-manager publication per the security review gate.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+# Restrict default permissions to read-only; elevate only where needed.
+# Only the `sign` job explicitly grants contents:write + id-token:write (it
+# creates the GitHub Release and cosign-signs checksums.txt). Every other
+# job — build, submit-winget, and all five smokes — is read-only, either via
+# its own explicit block or by inheriting this top-level default.
+permissions:
+  contents: read
+  id-token: none
+
+jobs:
+  # ── Build matrix ─────────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    if: github.repository == 'monkey1wizard/ccync'
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            platform: windows
+            arch: x64
+            binary_ext: .exe
+            archive_ext: .zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            platform: windows
+            arch: arm64
+            binary_ext: .exe
+            archive_ext: .zip
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            platform: darwin
+            arch: x64
+            binary_ext: ""
+            archive_ext: .tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            platform: darwin
+            arch: arm64
+            binary_ext: ""
+            archive_ext: .tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            platform: linux
+            arch: x64
+            binary_ext: ""
+            archive_ext: .tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            platform: linux
+            arch: arm64
+            binary_ext: ""
+            archive_ext: .tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (musl targets)
+        if: contains(matrix.target, 'musl')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build binary (native)
+        if: "!contains(matrix.target, 'musl')"
+        run: cargo build --release --target ${{ matrix.target }} -p ccync-cli
+
+      - name: Build binary (cross/musl)
+        if: contains(matrix.target, 'musl')
+        run: cross build --release --target ${{ matrix.target }} -p ccync-cli
+
+      - name: Prepare canonical asset names
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          BINARY_NAME="ccync-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.binary_ext }}"
+          ARCHIVE_NAME="ccync-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.archive_ext }}"
+          echo "BINARY_NAME=${BINARY_NAME}" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Copy and rename standalone binary asset
+        shell: bash
+        run: |
+          SRC="target/${{ matrix.target }}/release/ccync${{ matrix.binary_ext }}"
+          cp "${SRC}" "${BINARY_NAME}"
+
+      # ccync 0.1.0 shipped a Windows binary that launched into
+      # 0xC0000135 STATUS_DLL_NOT_FOUND on machines without the VC++
+      # redistributable, because the release build dynamically linked the
+      # MSVC C runtime. Assert statically-linked CRT on every Windows MSVC
+      # target so that regression can never reach a tagged release again.
+      # dumpbin.exe ships with the VS Build Tools, not on PATH by default,
+      # so it is located through vswhere.exe (the documented way to find a
+      # VS installation) rather than hardcoding a version-specific path.
+      - name: Assert static CRT linkage (Windows MSVC targets)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            Write-Error "vswhere.exe not found at expected path: $vswhere"
+            exit 1
+          }
+
+          $vsInstallPath = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsInstallPath) {
+            Write-Error "vswhere found no VS installation with the VC.Tools.x86.x64 component"
+            exit 1
+          }
+
+          $dumpbin = Get-ChildItem -Path "$vsInstallPath\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like '*Hostx64\x64*' } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) {
+            Write-Error "dumpbin.exe not found under $vsInstallPath\VC\Tools\MSVC"
+            exit 1
+          }
+
+          $imports = & $dumpbin /imports $env:BINARY_NAME
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "dumpbin /imports failed against $env:BINARY_NAME"
+            exit 1
+          }
+
+          $offender = $imports | Select-String -Pattern 'VCRUNTIME140|api-ms-win-crt'
+          if ($offender) {
+            Write-Error "Dynamic MSVC CRT dependency detected in $env:BINARY_NAME — this is the ccync 0.1.0 0xC0000135 STATUS_DLL_NOT_FOUND regression. Build must statically link the CRT (target-feature=+crt-static):`n$offender"
+            exit 1
+          }
+
+      # ccync ships a SINGLE self-contained binary. It bakes its catalog into the
+      # binary (embedded_catalog_json) and renders its canonical root at runtime
+      # from cloned/added plugins — it does NOT need a packaged source tree (unlike
+      # source-root-resolving CLIs). So the end-user archive is binary-only:
+      # the `ccync` binary plus LICENSE, nothing else.
+      - name: Stage end-user package (binary-only)
+        shell: bash
+        run: |
+          rm -rf pkg && mkdir -p pkg
+          cp "${BINARY_NAME}" "pkg/ccync${{ matrix.binary_ext }}"
+          cp LICENSE pkg/
+
+      - name: Create package archive (zip — Windows)
+        if: matrix.archive_ext == '.zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "pkg/*" -DestinationPath $env:ARCHIVE_NAME
+
+      - name: Create package archive (tar.gz — Unix)
+        if: matrix.archive_ext == '.tar.gz'
+        shell: bash
+        run: |
+          tar -czf "${ARCHIVE_NAME}" -C pkg .
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ env.BINARY_NAME }}
+          if-no-files-found: error
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ env.ARCHIVE_NAME }}
+          if-no-files-found: error
+
+  # ── Assemble + sign ───────────────────────────────────────────────────────
+  sign:
+    name: Assemble, sign, and publish
+    needs: build
+    if: needs.build.result == 'success' && github.repository == 'monkey1wizard/ccync'
+    runs-on: ubuntu-latest
+    # OIDC permission scoped to this job only (cosign trust surface).
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preflight — release tag matches crate version
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]*)?$ ]]; then
+            echo "::error::Release tag '${TAG}' does not match required syntax v<major>.<minor>.<patch>[-rc|-rcN]"
+            exit 1
+          fi
+          TAG_VERSION="${TAG#v}"
+          TAG_VERSION="${TAG_VERSION%%-rc*}"
+          CRATE_VERSION="$(grep -m1 '^version = ' crates/ccync-cli/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          if [[ "${TAG_VERSION}" != "${CRATE_VERSION}" ]]; then
+            echo "::error::Release tag '${TAG}' (version ${TAG_VERSION}) does not match crates/ccync-cli/Cargo.toml version ${CRATE_VERSION}"
+            exit 1
+          fi
+
+      - name: Enforce changelog gate + generate release body
+        shell: bash
+        run: |
+          bash packaging/release-body.sh "${{ github.ref_name }}" --output release-out/release-body.md
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets/
+
+      - name: Flatten asset directory
+        shell: bash
+        run: |
+          find assets/ -type f \( -name "*.exe" -o -name "*.zip" -o -name "*.tar.gz" -o ! -name "*.*" \) \
+            -exec mv {} ./  \;
+
+      # Generate checksums.txt, artifact-manifest.json, and the winget + homebrew
+      # manifests from the canonical assets. ccync has NO `release` CLI verb (the
+      # 9-verb public surface is frozen), so this is a self-contained POSIX script
+      # — no dependency on the binary, no shared tooling with any other product.
+      - name: Generate checksums + package-manager manifests
+        shell: bash
+        run: |
+          bash packaging/gen-release-artifacts.sh \
+            --version "${{ github.ref_name }}" \
+            --assets-dir . \
+            --output-dir release-out
+          cp release-out/checksums.txt ./checksums.txt
+          cp release-out/artifact-manifest.json ./artifact-manifest.json
+
+      - name: Upload package-manager manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-manager-manifests
+          path: release-out/manifests/
+          if-no-files-found: error
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksums.txt (cosign keyless — GitHub Actions OIDC)
+        # Produces checksums.txt.sig + checksums.txt.pem (certificate) in Rekor.
+        run: |
+          cosign sign-blob checksums.txt \
+            --yes \
+            --output-signature checksums.txt.sig \
+            --output-certificate checksums.txt.pem
+
+      - name: Push Homebrew formula to tap
+        # Requires a repo-scoped HOMEBREW_TAP_TOKEN with write access to the
+        # homebrew-tap repository (minimum: contents:write), added as a repository
+        # secret named HOMEBREW_TAP_TOKEN. The ccync formula (ccync.rb) is a
+        # distinct file in the tap — it never shares a formula with any other tool.
+        # winget manifest PR submission is handled manually for v1; automate later.
+        # Prerelease tags (containing '-', e.g. v0.1.0-rc4) must not update the
+        # public tap; only stable semver tags (no '-') push ccync.rb.
+        if: "env.HOMEBREW_TAP_TOKEN != '' && !contains(github.ref_name, '-')"
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/monkey1wizard/homebrew-tap.git" \
+            homebrew-tap
+          mkdir -p homebrew-tap/Formula
+          cp release-out/ccync.rb homebrew-tap/Formula/ccync.rb
+          cd homebrew-tap
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/ccync.rb
+          git diff --cached --quiet && exit 0  # nothing changed
+          git commit -m "chore(formula): update ccync to ${VERSION}"
+          git push
+
+      # Stable and prerelease tags publish through two mutually exclusive steps
+      # rather than one step with a conditional body_path input: softprops/action-gh-release
+      # rejects an empty body_path, so the stable-only curated body and the
+      # RC-only auto notes cannot share a single step's inputs.
+      - name: Create GitHub Release (stable — curated changelog body)
+        if: "!contains(github.ref_name, '-')"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ccync ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          body_path: release-out/release-body.md
+          files: |
+            ccync-*
+            checksums.txt
+            checksums.txt.sig
+            checksums.txt.pem
+            artifact-manifest.json
+            packaging/install.sh
+            packaging/install.ps1
+            release-out/manifests/m/Monkey1Wizard/ccync/*/*.yaml
+
+      - name: Create GitHub Release (prerelease — auto notes)
+        if: "contains(github.ref_name, '-')"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ccync ${{ github.ref_name }}
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            ccync-*
+            checksums.txt
+            checksums.txt.sig
+            checksums.txt.pem
+            artifact-manifest.json
+            packaging/install.sh
+            packaging/install.ps1
+            release-out/manifests/m/Monkey1Wizard/ccync/*/*.yaml
+
+  # ── Submit WinGet manifest (stable only) ────────────────────────────────
+  # WinGet submission opens a NEW winget-pkgs PR per release via WingetCreate,
+  # not an update to a prior open PR (komac's model). A superseded PR from an
+  # earlier attempt is a manual maintainer action — see the private manual.
+  # Prerelease tags (containing '-') never submit to the public winget-pkgs repo.
+  submit-winget:
+    name: Submit WinGet manifest
+    needs: sign
+    if: github.repository == 'monkey1wizard/ccync' && !contains(github.ref_name, '-')
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+
+    steps:
+      - name: Download package-manager manifests
+        uses: actions/download-artifact@v4
+        with:
+          name: package-manager-manifests
+          path: release-out/manifests/
+
+      - name: Resolve WinGet manifest version directory
+        shell: pwsh
+        run: |
+          $versionDirs = Get-ChildItem -Path "release-out/manifests/m/Monkey1Wizard/ccync" -Directory -ErrorAction SilentlyContinue
+          if (-not $versionDirs -or @($versionDirs).Count -ne 1) {
+            Write-Error "Expected exactly one version directory under release-out/manifests/m/Monkey1Wizard/ccync, found $(@($versionDirs).Count)"
+            exit 1
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "MANIFEST_DIR=$($versionDirs[0].FullName)"
+
+      - name: Repair WinGet if missing
+        shell: pwsh
+        run: |
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Write-Host "winget not found on PATH — repairing via Microsoft.WinGet.Client"
+            Install-Module -Name Microsoft.WinGet.Client -Force -Scope CurrentUser -Repository PSGallery
+            Repair-WinGetPackageManager
+          }
+          winget --version
+
+      - name: Validate WinGet manifest
+        shell: pwsh
+        run: |
+          winget validate "$env:MANIFEST_DIR"
+
+      - name: Report WinGet submission gate status
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrEmpty($env:WINGET_CREATE_GITHUB_TOKEN)) {
+            Write-Host "::notice::WINGET_CREATE_GITHUB_TOKEN is not set — skipping winget-pkgs submission. Manifests remain downloadable as a workflow artifact and Release asset."
+          } else {
+            Write-Host "WINGET_CREATE_GITHUB_TOKEN is present — proceeding with winget-pkgs submission."
+          }
+
+      - name: Install Microsoft.WingetCreate
+        if: env.WINGET_CREATE_GITHUB_TOKEN != ''
+        shell: pwsh
+        run: |
+          winget install --id Microsoft.WingetCreate --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
+          # WingetCreate answers a version request by printing its banner and
+          # then returning non-zero — it does that for `version` and `--version`
+          # alike, so the exit code carries no information about whether the tool
+          # is usable. Assert on the printed version instead, which is also the
+          # stronger check: it fails when no version was reported at all.
+          $versionOutput = (wingetcreate version 2>&1 | Out-String).Trim()
+          Write-Host $versionOutput
+          if ($versionOutput -notmatch 'WingetCreateCLI\s+\d+\.\d+') {
+            Write-Host "::error::wingetcreate reported no version — the install did not produce a usable tool"
+            exit 1
+          }
+          # The non-zero exit from the version request above lingers in
+          # $LASTEXITCODE, and the Actions pwsh wrapper appends
+          # `exit $LASTEXITCODE` at script end — so without an explicit success
+          # exit the step fails even after the assertion passed.
+          exit 0
+
+      - name: Submit WinGet manifest
+        if: env.WINGET_CREATE_GITHUB_TOKEN != ''
+        shell: pwsh
+        run: |
+          # The submit verb takes --prtitle / --replace / --token / --no-open and
+          # the manifest directory as its positional argument. There is no
+          # --submit option here; that flag belongs to the update verb, and
+          # passing it makes the parser reject the whole invocation.
+          wingetcreate submit --token $env:WINGET_CREATE_GITHUB_TOKEN "$env:MANIFEST_DIR"
+
+  # ── Post-release smokes ──────────────────────────────────────────────────
+  smoke-artifacts:
+    name: Smoke — artifact checksums + cosign signature
+    needs: sign
+    if: github.repository == 'monkey1wizard/ccync'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download ccync-* assets and checksums from the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'ccync-*' \
+            --pattern 'checksums.txt*'
+
+      - name: Verify checksums
+        run: |
+          sha256sum -c checksums.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify cosign signature over checksums.txt
+        run: |
+          cosign verify-blob checksums.txt \
+            --signature checksums.txt.sig \
+            --certificate checksums.txt.pem \
+            --certificate-identity-regexp '^https://github\.com/monkey1wizard/ccync/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+  smoke-cargo:
+    name: Smoke — cargo install (${{ matrix.os }})
+    needs: sign
+    if: github.repository == 'monkey1wizard/ccync'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Install ccync-cli from the triggering tag (fresh CARGO_HOME)
+        shell: bash
+        run: |
+          export CARGO_HOME="${{ runner.temp }}/cargohome"
+          mkdir -p "$CARGO_HOME"
+          cargo install --locked \
+            --git "https://github.com/${{ github.repository }}" \
+            --tag "${{ github.ref_name }}" \
+            ccync-cli
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
+
+      - name: Verify installed binary
+        run: |
+          ccync --version
+          ccync refresh
+
+  smoke-install-unix:
+    name: Smoke — installer (${{ matrix.os }})
+    needs: sign
+    if: github.repository == 'monkey1wizard/ccync'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      CCYNC_VERSION: ${{ github.ref_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Run install.sh from the triggering tag
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/packaging/install.sh" | bash
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify installed binary
+        run: |
+          ccync --version
+          ccync refresh
+
+  smoke-install-windows:
+    name: Smoke — installer (windows-latest)
+    needs: sign
+    if: github.repository == 'monkey1wizard/ccync'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    env:
+      CCYNC_VERSION: ${{ github.ref_name }}
+
+    steps:
+      - name: Run install.ps1 from the triggering tag
+        shell: pwsh
+        run: |
+          $script = Invoke-RestMethod "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/packaging/install.ps1"
+          Invoke-Expression $script
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.local\bin"
+
+      - name: Verify installed binary
+        shell: pwsh
+        run: |
+          ccync --version
+          ccync refresh
+
+  # Prerelease tags never update the tap (see the Push Homebrew formula step in
+  # `sign`), so this smoke is stable-only in lockstep with that same condition.
+  smoke-homebrew:
+    name: Smoke — Homebrew tap
+    needs: sign
+    if: github.repository == 'monkey1wizard/ccync' && !contains(github.ref_name, '-')
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Tap monkey1wizard/tap
+        run: brew tap monkey1wizard/tap
+
+      - name: Audit ccync formula (strict)
+        run: brew audit --strict monkey1wizard/tap/ccync
+
+      - name: Install ccync from the tap
+        run: brew install monkey1wizard/tap/ccync
+
+      - name: Run brew test
+        run: brew test ccync
+
+      - name: Verify installed binary
+        run: |
+          ccync --version
+          ccync refresh

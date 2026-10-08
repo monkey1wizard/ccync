@@ -1,0 +1,1 @@
+{"casks":[{"token":"demo","full_token":"homebrew/cask/demo","tap":"homebrew/cask","version":"1.0","artifacts":[{"binary":{"source":"source/demo","target":"bin/demo"}}]}]}
