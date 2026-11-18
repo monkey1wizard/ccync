@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "case", "mode", "result", "reason", "executionStarted", "missingPrerequisites", "evidencePaths", "publication", "checks", "gaps", "allowedVolatile", "childEnvironment", "processes", "cleanup"],
+  "properties": {
+    "version": {"const": 1},
+    "case": {"type": "string"},
+    "mode": {"enum": ["Fixture", "Native"]},
+    "result": {"enum": ["Passed", "Failed", "Blocked", "NotRun"]},
+    "reason": {"type": "string"},
+    "executionStarted": {"type": "boolean"},
+    "missingPrerequisites": {"type": "array", "items": {"type": "string"}},
+    "evidencePaths": {"type": "array", "items": {"type": "string"}},
+    "publication": {"enum": ["Passed", "Failed", "Blocked", "NotRun"]},
+    "checks": {"type": "array", "items": {"type": "object", "required": ["id", "result", "reason", "evidencePaths"], "properties": {"id": {"type": "string"}, "result": {"enum": ["Passed", "Failed", "Blocked", "NotRun"]}, "reason": {"type": "string"}, "evidencePaths": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false}},
+    "gaps": {"type": "array", "items": {"type": "string"}},
+    "allowedVolatile": {"type": "array", "items": {"type": "string"}},
+    "childEnvironment": {"type": "object", "additionalProperties": {"type": ["string", "null"]}},
+    "processes": {"type": "array", "items": {"$ref": "#/$defs/processIdentity"}},
+    "cleanup": {"type": "array", "items": {"type": "object", "required": ["identity", "stopped", "error"], "additionalProperties": false, "properties": {
+      "identity": {"$ref": "#/$defs/processIdentity"}, "stopped": {"type": "boolean"}, "error": {"type": "string"}
+    }}}
+  },
+  "$defs": {
+    "processIdentity": {"type": "object", "required": ["pid", "parentPid", "created"], "additionalProperties": false, "properties": {
+      "pid": {"type": "integer", "minimum": 1}, "parentPid": {"type": "integer", "minimum": 0}, "created": {"type": "integer", "minimum": 0}
+    }}
+  }
+}

@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test-linux:
+    if: github.repository != 'monkey1wizard/ccync-private' || github.event_name == 'workflow_dispatch'
+    name: Ubuntu tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Configure disposable runner Git identity
+        shell: bash
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.13.6
+      - name: Run release gate
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REPOSITORY" == 'monkey1wizard/ccync-private' ]]; then
+            bash packaging/publish-public.sh --gate --receipt "$RUNNER_TEMP/linux.receipt"
+          else
+            bash packaging/publish-public.sh --gate --checkout-sha "$GITHUB_SHA" --receipt "$RUNNER_TEMP/linux.receipt"
+          fi
+      - name: Upload gate receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-linux
+          path: ${{ runner.temp }}/linux.receipt
+          if-no-files-found: error
+
+  test-windows:
+    if: github.repository != 'monkey1wizard/ccync-private' || github.event_name == 'workflow_dispatch'
+    name: Windows tests
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Configure disposable runner Git identity
+        shell: bash
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.13.6
+      - name: Run release gate
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REPOSITORY" == 'monkey1wizard/ccync-private' ]]; then
+            bash packaging/publish-public.sh --gate --receipt "$RUNNER_TEMP/windows.receipt"
+          else
+            bash packaging/publish-public.sh --gate --checkout-sha "$GITHUB_SHA" --receipt "$RUNNER_TEMP/windows.receipt"
+          fi
+      - name: Upload gate receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-windows
+          path: ${{ runner.temp }}/windows.receipt
+          if-no-files-found: error
+
+  test-public-snapshot-linux:
+    name: Ubuntu public snapshot tests
+    if: github.repository == 'monkey1wizard/ccync-private' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.13.6
+      - name: Export and test public snapshot
+        shell: bash
+        run: |
+          git remote add github https://github.com/monkey1wizard/ccync.git
+          SNAPSHOT="$RUNNER_TEMP/public-snapshot"
+          bash packaging/publish-public.sh --keep-snapshot "$SNAPSHOT"
+          cd "$SNAPSHOT"
+          cargo test --workspace --locked
+
+  test-public-snapshot-windows:
+    name: Windows public snapshot tests
+    if: github.repository == 'monkey1wizard/ccync-private' && github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.13.6
+      - name: Export and test public snapshot
+        shell: bash
+        run: |
+          git remote add github https://github.com/monkey1wizard/ccync.git
+          SNAPSHOT="$RUNNER_TEMP/public-snapshot"
+          bash packaging/publish-public.sh --keep-snapshot "$SNAPSHOT"
+          cd "$SNAPSHOT"
+          cargo test --workspace --locked

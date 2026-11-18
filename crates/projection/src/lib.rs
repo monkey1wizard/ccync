@@ -1,0 +1,3021 @@
+//! (file) projection backend — turns skills/commands into runtime surface files.
+//!
+//! Owns the AGY + Claude skill/file projection backends.
+
+pub mod agy;
+pub mod claude_skill;
+pub mod codex_agent;
+pub mod tool_map;
+
+#[cfg(test)]
+mod claude_shape_agent_tests;
+#[cfg(test)]
+mod command_skill_prune_tests;
+#[cfg(test)]
+mod flat_command_tests;
+pub mod managed_block;
+#[cfg(test)]
+mod managed_block_classify_tests;
+#[cfg(test)]
+mod managed_block_dedupe_tests;
+#[cfg(test)]
+mod managed_block_emit_tests;
+#[cfg(test)]
+mod managed_block_health_tests;
+#[cfg(test)]
+mod managed_block_io_tests;
+#[cfg(test)]
+mod managed_block_parse_tests;
+#[cfg(test)]
+mod provider_tests;
+mod support;
+#[cfg(test)]
+mod tests;
+
+// SkillsProjectionHealthCheck is the only cross-crate consumer surface (cli doctor);
+// AgyRootOwnership is the ownership handle ccync-engine constructs to publish
+// an agy-* root; the rest are crate-internal helpers used by the update_*
+// drivers below.
+use support::*;
+pub use support::{
+    decode_managed_artifact_key, direct_records, forget_direct_record,
+    normalize_managed_artifact_path, paths_share_filesystem, remove_source_link,
+    retire_shared_path, shared_path_fingerprint, source_link_records, strip_lockfile_to_agy_rows,
+    AgyRootOwnership, DirectArtifactKind, DirectProjectionRecord, ManagedDeprojection,
+    SharedPathReader, SharedPathReaderState, SharedPathRetirement, SharedPathRetirementOutcome,
+    SkillsProjectionHealthCheck,
+};
+
+/// Evidence binding an embedded discovery manifest to the source and reader versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandaloneManifestProof {
+    pub path: ccync_foundation::provider::RelativePath,
+    pub fingerprint: String,
+    pub source_id: String,
+    pub revision: String,
+    /// Every supplied reader must have a nonempty tested version.
+    pub reader_versions: BTreeMap<String, String>,
+}
+
+/// Inputs supplied by the engine after resolving the winning source and route.
+/// The engine holds the lifecycle lock throughout preparation and completion.
+#[derive(Debug, Clone)]
+pub struct StandalonePublicationRequest {
+    pub operation_id: String,
+    pub source_path: PathBuf,
+    /// Actual winning origin, never the merged render provider.
+    pub source_id: String,
+    /// Upstream pin, committed snapshot digest, or loose-origin content proof.
+    pub source_revision: String,
+    pub destination: ccync_foundation::provider::ScopedPath,
+    /// Explicit resolution of destination.root, supporting isolated callers.
+    pub destination_root: PathBuf,
+    pub build_root: PathBuf,
+    pub stage_path: ccync_foundation::provider::RelativePath,
+    pub backup_path: ccync_foundation::provider::RelativePath,
+    pub discovery_roots: Vec<PathBuf>,
+    pub targets: Vec<String>,
+    /// Delegated, disabled, colliding, or prune-reserved paths cannot be published.
+    pub reserved_paths: Vec<PathBuf>,
+    /// Expected committed attribution for a replacement. None requires absence.
+    pub prior_owner: Option<String>,
+    /// Committed preimage fingerprint, required for every existing destination.
+    /// Standalone rows require their permission-aware tree_fingerprint. Legacy
+    /// ownership rows may use shared_path_fingerprint during migration.
+    pub owned_fingerprint: Option<String>,
+    pub manifest_proofs: Vec<StandaloneManifestProof>,
+}
+
+/// Version and content proof stored inside the existing projection registry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StandaloneProjectionRecord {
+    pub path: PathBuf,
+    pub source_id: String,
+    pub source_revision: String,
+    pub source_fingerprint: String,
+    /// Permission-aware standalone proof. Verify with standalone_source_fingerprint,
+    /// never shared_path_fingerprint, whose content-only contract is unchanged.
+    pub tree_fingerprint: String,
+    pub targets: Vec<String>,
+}
+
+/// Read standalone proof only for matching direct ownership rows.
+pub fn standalone_publication_records(
+    lockfile_path: &Path,
+) -> Result<Vec<StandaloneProjectionRecord>, ProjectionError> {
+    support::standalone_publication_records(lockfile_path)
+}
+
+/// Read-only preparation result. Its intent must be persisted before staging.
+/// Private state binds every later mutation to the validated paths and preimages.
+#[derive(Debug, Clone)]
+pub struct PreparedStandalonePublication {
+    request: StandalonePublicationRequest,
+    intent: ccync_foundation::provider::StandalonePublicationIntent,
+    source_tree: BTreeMap<PathBuf, support::StandaloneSnapshotEntry>,
+    destination_tree: Option<BTreeMap<PathBuf, support::StandaloneSnapshotEntry>>,
+    destination: PathBuf,
+    stage: PathBuf,
+    backup: PathBuf,
+}
+
+impl PreparedStandalonePublication {
+    pub fn intent(&self) -> &ccync_foundation::provider::StandalonePublicationIntent {
+        &self.intent
+    }
+}
+
+/// Inspect a source or published tree with preparation's complete-subtree policy.
+/// The standalone-v1 fingerprint includes permissions and is distinct from
+/// shared_path_fingerprint. Unix special mode bits are rejected.
+pub fn standalone_source_fingerprint(source: &Path) -> Result<String, ProjectionError> {
+    support::standalone_source_fingerprint(source)
+}
+
+/// Validate paths, provenance, loading boundaries, ownership and complete content.
+/// This function never creates a file or directory.
+pub fn prepare_standalone_publication(
+    request: StandalonePublicationRequest,
+) -> Result<PreparedStandalonePublication, ProjectionError> {
+    support::prepare_standalone_publication(request)
+}
+
+/// Reconstruct a matching pending publication after an interruption.
+/// Source proof and every occupied path are checked against the durable intent.
+pub fn resume_standalone_publication(
+    request: StandalonePublicationRequest,
+    durable_intent: &ccync_foundation::provider::StandalonePublicationIntent,
+) -> Result<PreparedStandalonePublication, ProjectionError> {
+    support::resume_standalone_publication(request, durable_intent)
+}
+
+/// Stage only after the engine durably records prepared.intent().
+pub fn stage_standalone_publication(
+    prepared: &PreparedStandalonePublication,
+    durable_intent: &ccync_foundation::provider::StandalonePublicationIntent,
+) -> Result<(), ProjectionError> {
+    support::stage_standalone_publication(prepared, durable_intent)
+}
+
+/// Recheck source, registry, destination and stage before retaining and switching.
+pub fn publish_standalone_publication(
+    prepared: &PreparedStandalonePublication,
+    durable_intent: &ccync_foundation::provider::StandalonePublicationIntent,
+) -> Result<(), ProjectionError> {
+    support::publish_standalone_publication(prepared, durable_intent)
+}
+
+/// Validate the published tree and persist the existing ownership registry.
+/// Backup retention is independent of successful registry persistence.
+pub fn complete_standalone_publication(
+    prepared: &PreparedStandalonePublication,
+    durable_intent: &ccync_foundation::provider::StandalonePublicationIntent,
+) -> Result<(), ProjectionError> {
+    support::complete_standalone_publication(prepared, durable_intent)
+}
+
+/// After registry completion and journal clearing, remove only this intent's backup.
+pub fn cleanup_standalone_publication(
+    prepared: &PreparedStandalonePublication,
+    completed_intent: &ccync_foundation::provider::StandalonePublicationIntent,
+) -> Result<(), ProjectionError> {
+    support::cleanup_standalone_publication(prepared, completed_intent)
+}
+
+/// Current reader proofs and committed provenance for withdrawing one skill.
+/// The caller holds the lifecycle lock and refreshes the complete reader inventory.
+#[derive(Debug, Clone)]
+pub struct StandaloneWithdrawalRequest {
+    pub operation_id: String,
+    pub committed_record: StandaloneProjectionRecord,
+    pub readers: Vec<ccync_foundation::provider::StandaloneWithdrawalReaderProof>,
+    pub destination: ccync_foundation::provider::ScopedPath,
+    pub destination_root: PathBuf,
+    pub build_root: PathBuf,
+    pub backup_path: ccync_foundation::provider::RelativePath,
+    pub discovery_roots: Vec<PathBuf>,
+    pub reserved_paths: Vec<PathBuf>,
+}
+
+/// Read-only preparation, bound to the exact committed row and retained preimage.
+#[derive(Debug, Clone)]
+pub struct PreparedStandaloneWithdrawal {
+    request: StandaloneWithdrawalRequest,
+    intent: ccync_foundation::provider::StandaloneWithdrawalIntent,
+    destination_tree: Option<BTreeMap<PathBuf, support::StandaloneSnapshotEntry>>,
+    destination: PathBuf,
+    backup: PathBuf,
+}
+
+impl PreparedStandaloneWithdrawal {
+    pub fn intent(&self) -> &ccync_foundation::provider::StandaloneWithdrawalIntent {
+        &self.intent
+    }
+}
+
+/// Verify ownership, readers and private paths without writing.
+pub fn prepare_standalone_withdrawal(
+    request: StandaloneWithdrawalRequest,
+) -> Result<PreparedStandaloneWithdrawal, ProjectionError> {
+    support::prepare_standalone_withdrawal(request)
+}
+
+/// Reconstruct a pending withdrawal using fresh reader and source intent proofs.
+pub fn resume_standalone_withdrawal(
+    request: StandaloneWithdrawalRequest,
+    intent: &ccync_foundation::provider::StandaloneWithdrawalIntent,
+) -> Result<PreparedStandaloneWithdrawal, ProjectionError> {
+    support::resume_standalone_withdrawal(request, intent)
+}
+
+/// After durable intent verification, move the exact preimage out of discovery.
+pub fn apply_standalone_withdrawal(
+    prepared: &PreparedStandaloneWithdrawal,
+    intent: &ccync_foundation::provider::StandaloneWithdrawalIntent,
+) -> Result<(), ProjectionError> {
+    support::apply_standalone_withdrawal(prepared, intent)
+}
+
+/// Verify absence and retained content before atomically removing ownership.
+pub fn complete_standalone_withdrawal(
+    prepared: &PreparedStandaloneWithdrawal,
+    intent: &ccync_foundation::provider::StandaloneWithdrawalIntent,
+) -> Result<(), ProjectionError> {
+    support::complete_standalone_withdrawal(prepared, intent)
+}
+
+/// Remove the exact backup only after registry completion and intent clearing.
+pub fn cleanup_standalone_withdrawal(
+    prepared: &PreparedStandaloneWithdrawal,
+    intent: &ccync_foundation::provider::StandaloneWithdrawalIntent,
+) -> Result<(), ProjectionError> {
+    support::cleanup_standalone_withdrawal(prepared, intent)
+}
+
+use ccync_foundation::config::{CcyncConfig, LegacyState};
+use ccync_foundation::provider::{ComponentIdentity, TargetAlias};
+use ccync_foundation::target::{ProjectionTargetId, CANONICAL_PROJECTION_TARGETS};
+use codex_agent::parse_agent_meta;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+
+pub(crate) const CCYNC_MANAGED_FILE_HEADER: &str =
+    "# Generated by CCYNC Setup-Machine. Do not edit manually.";
+
+/// A single warning collected by a [`ProjectionReport`]-shaped internal
+/// scratch step. Crate-internal only — external consumers observe warnings
+/// via [`ProjectionEvidence::run_warnings`] or a target's own
+/// [`ProjectionTargetEvidence::warnings`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProjectionWarning {
+    pub message: String,
+}
+
+/// Internal scratch accumulator for a single report-mutating projection step
+/// (`ensure_dir_link`, `write_command_skill`, `ManagedArtifactRegistry::load`/
+/// `persist`, and similar low-level helpers that have not yet been converted
+/// to attribute directly into a [`ProjectionEvidence`]). Not part of the
+/// crate's public API — every producer-level entry point
+/// (`run_update_skills`/`run_update_commands`/`run_update_personalization`/
+/// `run_machine_update`) returns [`ProjectionEvidence`] exclusively; this
+/// type never crosses that boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProjectionReport {
+    pub written_files: Vec<PathBuf>,
+    pub removed_paths: Vec<PathBuf>,
+    pub created_links: Vec<PathBuf>,
+    pub warnings: Vec<ProjectionWarning>,
+}
+
+/// How a single path was touched by a target-owned projection step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionPathChange {
+    Written,
+    Removed,
+    Linked,
+}
+
+/// A single path touched by a target-owned projection step, and how.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionPathResult {
+    pub path: PathBuf,
+    pub change: ProjectionPathChange,
+}
+
+/// A target-owned projection step's own expected (non-panicking) failure.
+/// `path` is the path the failure relates to, when the failure is path-scoped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionExpectedFailure {
+    pub path: Option<PathBuf>,
+    pub reason: String,
+}
+
+/// Rejected when a `ProjectionTargetEvidence` construction attempt sets both
+/// `skipped` and `failure` — a target step is either skipped, failed, or
+/// neither, never both at once.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("a target's evidence cannot carry both `skipped` and `failure`")]
+pub struct ProjectionTargetEvidenceConflict;
+
+/// The evidence a single projection target's own step produced: the paths it
+/// touched, any non-fatal warnings, and — mutually exclusively — whether the
+/// step was skipped or hit an expected failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectionTargetEvidence {
+    pub paths: Vec<ProjectionPathResult>,
+    pub warnings: Vec<String>,
+    pub skipped: Option<String>,
+    pub failure: Option<ProjectionExpectedFailure>,
+}
+
+impl ProjectionTargetEvidence {
+    /// Construct evidence, rejecting a `skipped` + `failure` combination.
+    pub fn new(
+        paths: Vec<ProjectionPathResult>,
+        warnings: Vec<String>,
+        skipped: Option<String>,
+        failure: Option<ProjectionExpectedFailure>,
+    ) -> Result<Self, ProjectionTargetEvidenceConflict> {
+        if skipped.is_some() && failure.is_some() {
+            return Err(ProjectionTargetEvidenceConflict);
+        }
+        Ok(Self {
+            paths,
+            warnings,
+            skipped,
+            failure,
+        })
+    }
+
+    /// `false` when `skipped` and `failure` are both `Some` — the one state a
+    /// `ProjectionTargetEvidence` must never be in, however it was built.
+    pub fn is_valid(&self) -> bool {
+        !(self.skipped.is_some() && self.failure.is_some())
+    }
+}
+
+/// Run-wide projection evidence, target-scoped. There is no standalone
+/// per-run outcome type: every target-owned result nests under its
+/// [`ProjectionTargetId`] in `by_target`, and shared registry/lockfile
+/// evidence that is not owned by any single target lives in `common`.
+///
+/// `completed_targets` and `by_target` are deliberately separate collections:
+/// a target present in `completed_targets` completed that phase even when it
+/// has no `by_target` entry (nothing to report — empty-but-completed); a
+/// target absent from `completed_targets` did not complete that phase at all
+/// (absent, not merely empty).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectionEvidence {
+    pub common: Vec<ProjectionPathResult>,
+    pub by_target: BTreeMap<ProjectionTargetId, ProjectionTargetEvidence>,
+    pub completed_targets: BTreeSet<ProjectionTargetId>,
+    pub run_warnings: Vec<String>,
+}
+
+/// A single skill/agent source directory registered for projection.
+///
+/// `id` uniquely identifies the source (e.g. `"ccync"`, `"my-bundle"`).
+/// `persistent` marks sources whose projected artifacts must not be pruned
+/// when the source is temporarily absent from the active invocation set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionSource {
+    pub root: PathBuf,
+    pub id: String,
+    pub persistent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillUpdateOptions {
+    pub repo_root: PathBuf,
+    pub state_root: PathBuf,
+    /// Ordered source list; ccync-core must always be first (baseline).
+    /// Single-source callers pass a 1-element `Vec`.
+    pub sources: Vec<ProjectionSource>,
+    pub user_home: PathBuf,
+    pub selected_projection_targets: Vec<String>,
+    pub dry_run: bool,
+    pub replace: bool,
+}
+
+pub type CommandUpdateOptions = SkillUpdateOptions;
+
+/// Provider inventory used by the additive provider-aware projection API.
+/// Existing projection callers can continue using `SkillUpdateOptions`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderProjectionInventory {
+    pub identities: Vec<ComponentIdentity>,
+    /// Previously published aliases. Reusing this inventory keeps names stable
+    /// when a colliding provider is temporarily absent.
+    pub aliases: Vec<TargetAlias>,
+}
+
+/// Plan target invocation names from a complete provider inventory.
+/// Unique original component ids remain unchanged. Only collision groups are
+/// qualified with their original provider name and source key.
+pub fn plan_provider_aliases(
+    target: ProjectionTargetId,
+    inventory: &ProviderProjectionInventory,
+) -> Result<Vec<TargetAlias>, ProjectionError> {
+    support::plan_provider_aliases(target, inventory)
+}
+
+/// Resolve a generated reference through a provider alias map. Ambiguous
+/// original names fail closed before a caller writes projected artifacts.
+pub fn resolve_provider_reference(
+    name: &str,
+    inventory: &ProviderProjectionInventory,
+    aliases: &[TargetAlias],
+    target: ProjectionTargetId,
+) -> Result<Option<String>, ProjectionError> {
+    support::resolve_provider_reference(name, &inventory.identities, aliases, target)
+}
+
+/// Rewrite slash-command references generated by CCYNC using the target alias
+/// map. Free-form upstream text remains untouched.
+pub fn rewrite_generated_provider_references(
+    body: &str,
+    inventory: &ProviderProjectionInventory,
+    aliases: &[TargetAlias],
+    target: ProjectionTargetId,
+) -> Result<String, ProjectionError> {
+    support::rewrite_generated_provider_references(body, &inventory.identities, aliases, target)
+}
+
+/// Provider package supplied to the non-native surface publisher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSurfacePackage {
+    pub source_id: String,
+    /// Logical component directory under `skills/` for flat OpenCode discovery.
+    pub component_id: String,
+    /// Target-planned invocation alias. OpenCode publishes each skill at this name.
+    pub alias: String,
+    pub root: PathBuf,
+}
+
+/// One provider skill selected for publication on one or more planned roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectSkillPackage {
+    pub source_id: String,
+    pub original_name: String,
+    pub alias: String,
+    pub source_path: PathBuf,
+}
+
+/// A physical discovery root and the targets the route plan assigns to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectSkillRoot {
+    pub path: PathBuf,
+    pub targets: Vec<ProjectionTargetId>,
+}
+
+/// Planned direct skill publication. Targets served by a shared root are
+/// listed separately and do not receive a private copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectSkillsPlan {
+    pub packages: Vec<DirectSkillPackage>,
+    pub roots: Vec<DirectSkillRoot>,
+    pub served_targets: Vec<ProjectionTargetId>,
+}
+
+/// One validated agent definition selected for direct publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectAgentInput {
+    pub source_id: String,
+    pub name: String,
+    pub content: String,
+}
+
+/// One agent definition assigned to one target surface. A physical destination
+/// shared by several targets is written once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectAgentAssignment {
+    pub target: ProjectionTargetId,
+    pub input: DirectAgentInput,
+}
+
+/// Explicit direct agent publication across every provider and target. The
+/// whole batch shares one registry load and one persist, so each writer's
+/// ownership proof is kept alongside the others'.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectAgentPublication {
+    pub assignments: Vec<DirectAgentAssignment>,
+}
+
+/// Publish exactly the assigned agent definitions. Incompatible definitions
+/// for one destination block that destination before any write.
+pub fn publish_direct_agent_plan(
+    publication: &DirectAgentPublication,
+    user_home: &Path,
+    lockfile_path: &Path,
+    dry_run: bool,
+) -> ProjectionEvidence {
+    support::publish_direct_agent_plan(publication, user_home, lockfile_path, dry_run)
+}
+
+/// Publish agent definitions to one native target surface with registry ownership checks.
+/// New callers assign targets with [`publish_direct_agent_plan`].
+pub fn publish_direct_agents(
+    target: ProjectionTargetId,
+    agents: &[DirectAgentInput],
+    user_home: &Path,
+    lockfile_path: &Path,
+    dry_run: bool,
+) -> ProjectionEvidence {
+    let publication = DirectAgentPublication {
+        assignments: agents
+            .iter()
+            .map(|input| DirectAgentAssignment {
+                target,
+                input: input.clone(),
+            })
+            .collect(),
+    };
+    publish_direct_agent_plan(&publication, user_home, lockfile_path, dry_run)
+}
+
+/// Physical form of one prepared command on one target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectCommandDestination {
+    /// A native command file, such as `commands/<alias>.md` on Claude or OpenCode.
+    NativeCommand,
+    /// A command converted to `<skills>/<alias>/SKILL.md`. Only a conversion
+    /// the planner approved may use this form.
+    CommandSkill,
+}
+
+/// One prepared command bound to one target. `content` is the final file
+/// text, and `alias` is the destination name chosen by the planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectCommandAssignment {
+    pub target: ProjectionTargetId,
+    pub source_id: String,
+    pub alias: String,
+    pub content: String,
+    pub destination: DirectCommandDestination,
+}
+
+/// Explicit direct command publication across every provider. The batch
+/// shares one registry load and one persist, so each provider's ownership
+/// rows are kept together.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectCommandPublication {
+    pub assignments: Vec<DirectCommandAssignment>,
+}
+
+/// Publish exactly the prepared command assignments. Nothing is rescanned from
+/// command sources and no content is rendered here. Conflicting assignments
+/// for one destination block that destination before any write.
+pub fn publish_direct_command_plan(
+    publication: &DirectCommandPublication,
+    user_home: &Path,
+    lockfile_path: &Path,
+    dry_run: bool,
+) -> ProjectionEvidence {
+    support::publish_direct_command_plan(publication, user_home, lockfile_path, dry_run)
+}
+
+/// Why a slash command cannot be represented as a target skill without
+/// changing its invocation contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandSkillUnsupportedReason {
+    PositionalArguments,
+    ArgumentExpansion,
+    NamespacedCommand,
+}
+
+impl std::fmt::Display for CommandSkillUnsupportedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PositionalArguments => {
+                f.write_str("positional command arguments are not equivalent to skill arguments")
+            }
+            Self::ArgumentExpansion => f.write_str(
+                "command argument expansion is not equivalent to skill argument expansion",
+            ),
+            Self::NamespacedCommand => f.write_str(
+                "namespaced command invocation cannot be preserved by this skill surface",
+            ),
+        }
+    }
+}
+
+/// Guarded input for a command-to-skill conversion. The source is validated
+/// before any projection writes so unsupported invocations cannot leave a
+/// partial command publication behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectCommandSkillInput {
+    pub name: String,
+    pub body: String,
+}
+
+impl DirectCommandSkillInput {
+    pub fn unsupported_reason(&self) -> Option<CommandSkillUnsupportedReason> {
+        if self.name.contains('/') || self.name.contains('\\') {
+            return Some(CommandSkillUnsupportedReason::NamespacedCommand);
+        }
+        if self.body.contains("$1") || self.body.contains("$2") || self.body.contains("$3") {
+            return Some(CommandSkillUnsupportedReason::PositionalArguments);
+        }
+        if self.body.contains("$@") || self.body.contains("$*") {
+            return Some(CommandSkillUnsupportedReason::ArgumentExpansion);
+        }
+        None
+    }
+}
+
+/// One provider skill assigned to one physical root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectSkillAssignment {
+    pub package: DirectSkillPackage,
+    pub root: DirectSkillRoot,
+}
+
+/// Explicit direct skill publication. Only the listed package/root pairs are
+/// written, so a provider never receives a root its route plan did not assign.
+/// Targets in `served_targets` receive no private copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectSkillPublication {
+    pub assignments: Vec<DirectSkillAssignment>,
+    pub served_targets: Vec<ProjectionTargetId>,
+}
+
+/// Publish exactly the assigned package/root pairs. A destination shared by
+/// several pairs is written once.
+pub fn publish_direct_skill_plan(
+    publication: &DirectSkillPublication,
+    lockfile_path: &Path,
+    dry_run: bool,
+) -> ProjectionEvidence {
+    support::publish_direct_skill_plan(publication, lockfile_path, dry_run)
+}
+
+/// Publish every package to every root in `plan`, preserving resources and
+/// relative links. New callers assign pairs with [`publish_direct_skill_plan`].
+pub fn publish_direct_skills(
+    plan: &DirectSkillsPlan,
+    lockfile_path: &Path,
+    dry_run: bool,
+) -> ProjectionEvidence {
+    let assignments = plan
+        .packages
+        .iter()
+        .flat_map(|package| {
+            plan.roots.iter().map(move |root| DirectSkillAssignment {
+                package: package.clone(),
+                root: root.clone(),
+            })
+        })
+        .collect();
+    publish_direct_skill_plan(
+        &DirectSkillPublication {
+            assignments,
+            served_targets: plan.served_targets.clone(),
+        },
+        lockfile_path,
+        dry_run,
+    )
+}
+
+/// Publish complete provider packages to one selected non-native discovery root.
+/// Native Codex and Claude packages are intentionally not handled here.
+pub fn publish_provider_surfaces(
+    target: ProjectionTargetId,
+    packages: &[ProviderSurfacePackage],
+    user_home: &Path,
+    lockfile_path: &Path,
+    dry_run: bool,
+) -> ProjectionEvidence {
+    support::publish_provider_surfaces(target, packages, user_home, lockfile_path, dry_run)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonalizationUpdateOptions {
+    pub repo_root: PathBuf,
+    pub source_root: PathBuf,
+    pub user_home: PathBuf,
+    pub appdata_root: PathBuf,
+    pub selected_projection_targets: Vec<String>,
+    pub dry_run: bool,
+    pub replace: bool,
+    pub uninstall: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineUpdateOptions {
+    pub repo_root: PathBuf,
+    pub source_root: PathBuf,
+    pub state_root: PathBuf,
+    pub user_home: PathBuf,
+    pub appdata_root: PathBuf,
+    pub selected_projection_targets: Vec<String>,
+    pub dry_run: bool,
+    pub replace: bool,
+    pub uninstall: bool,
+    pub include_source_projections: bool,
+}
+
+impl MachineUpdateOptions {
+    /// Construct machine update options from target-named values and explicit roots.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        repo_root: PathBuf,
+        source_root: PathBuf,
+        state_root: PathBuf,
+        user_home: PathBuf,
+        appdata_root: PathBuf,
+        selected_projection_targets: Vec<String>,
+        dry_run: bool,
+        replace: bool,
+        uninstall: bool,
+        include_source_projections: bool,
+    ) -> Self {
+        Self {
+            state_root,
+            repo_root,
+            source_root,
+            user_home,
+            appdata_root,
+            selected_projection_targets,
+            dry_run,
+            replace,
+            uninstall,
+            include_source_projections,
+        }
+    }
+
+    /// Accessor for the `selected_projection_targets` field.
+    pub fn selected_projection_targets(&self) -> &[String] {
+        &self.selected_projection_targets
+    }
+
+    /// Setter for the `selected_projection_targets` field.
+    pub fn set_selected_projection_targets(&mut self, targets: Vec<String>) {
+        self.selected_projection_targets = targets;
+    }
+}
+
+/// The direct publication family that a machine writer touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectDelegationComponent {
+    /// A skill directory or link.
+    Skill,
+    /// An agent file.
+    Agent,
+    /// A native command file.
+    Command,
+    /// A command projected as `<root>/<name>/SKILL.md`.
+    CommandSkill,
+}
+
+/// The verdict that direct publication reached for one destination.
+///
+/// Every verdict withholds machine writes and pruning at its destination. The
+/// verdict is kept so that reports can say why direct publication holds a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectDelegationOutcome {
+    Delegated,
+    Blocked,
+    Unsupported,
+    Disabled,
+}
+
+/// One direct publication decision that machine writers must respect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectDelegationDecision {
+    /// The source that supplies the content for this destination.
+    pub producer: String,
+    pub component: DirectDelegationComponent,
+    pub target: ProjectionTargetId,
+    /// The physical path the decision covers. A command skill covers its `SKILL.md`.
+    pub destination: PathBuf,
+    /// The machine writer that would otherwise own this destination.
+    pub legacy_writer: String,
+    pub outcome: DirectDelegationOutcome,
+}
+
+/// The delegation scope that machine writers honor during one run.
+///
+/// The default scope has no decisions and is available, so machine writers
+/// behave as they did before delegation existed. An unavailable scope means
+/// the direct decisions could not be computed. Machine writers then withhold
+/// every direct component write and prune, while personalization and settings
+/// still run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineProjectionScope {
+    pub decisions: Vec<DirectDelegationDecision>,
+    pub unavailable: bool,
+}
+
+/// Legacy writer identity for the skill phase of a machine update.
+const SKILLS_LEGACY_WRITER: &str = "update_skills";
+/// Legacy writer identity for the command phase of a machine update.
+const COMMANDS_LEGACY_WRITER: &str = "update_commands";
+/// Phase-level note recorded when the delegation scope is unavailable.
+const UNAVAILABLE_SCOPE_WARNING: &str =
+    "direct publication scope unavailable: direct component writes and prunes withheld";
+
+fn decision_overlaps(
+    decision: &DirectDelegationDecision,
+    component: DirectDelegationComponent,
+    legacy_writer: &str,
+    path: &Path,
+) -> bool {
+    decision.component == component
+        && decision.legacy_writer == legacy_writer
+        && (decision.destination.starts_with(path) || path.starts_with(&decision.destination))
+}
+
+impl MachineProjectionScope {
+    /// Whether a machine write or removal at `path` must be withheld.
+    ///
+    /// A decision withholds every path that overlaps its destination in either
+    /// direction. A machine write therefore cannot replace a delegated path,
+    /// land inside one, or remove a directory that contains one.
+    pub(crate) fn withholds(
+        &self,
+        component: DirectDelegationComponent,
+        legacy_writer: &str,
+        path: &Path,
+    ) -> bool {
+        self.unavailable
+            || self
+                .decisions
+                .iter()
+                .any(|decision| decision_overlaps(decision, component, legacy_writer, path))
+    }
+
+    /// Whether a whole-directory removal at `path` must be withheld.
+    ///
+    /// Checks every component and writer, because one delegated entry under a
+    /// directory makes deleting that directory unsafe.
+    pub(crate) fn withholds_tree(&self, path: &Path) -> bool {
+        self.unavailable
+            || self.decisions.iter().any(|decision| {
+                decision.destination.starts_with(path) || path.starts_with(&decision.destination)
+            })
+    }
+
+    /// Entry names under `root` that direct publication reserves for `component`.
+    ///
+    /// A prune keeps these names so that it cannot remove a delegated entry.
+    pub(crate) fn reserved_names(
+        &self,
+        component: DirectDelegationComponent,
+        legacy_writer: &str,
+        root: &Path,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .decisions
+            .iter()
+            .filter(|decision| {
+                decision.component == component && decision.legacy_writer == legacy_writer
+            })
+            .filter_map(|decision| {
+                decision
+                    .destination
+                    .strip_prefix(root)
+                    .ok()?
+                    .components()
+                    .next()
+            })
+            .filter_map(|entry| entry.as_os_str().to_str().map(str::to_string))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Whether pruning under `root` must not run at all.
+    ///
+    /// Pruning stops when the scope is unavailable, or when a decision covers
+    /// `root` itself, because then any entry under `root` may be delegated.
+    pub(crate) fn prune_withheld(
+        &self,
+        component: DirectDelegationComponent,
+        legacy_writer: &str,
+        root: &Path,
+    ) -> bool {
+        self.unavailable
+            || self.decisions.iter().any(|decision| {
+                decision.component == component
+                    && decision.legacy_writer == legacy_writer
+                    && root.starts_with(&decision.destination)
+            })
+    }
+}
+
+/// Appends reserved entry names to the active names that a prune keeps.
+fn keep_names_with<'a>(active: &[&'a str], reserved: &'a [String]) -> Vec<&'a str> {
+    active
+        .iter()
+        .copied()
+        .chain(reserved.iter().map(String::as_str))
+        .collect()
+}
+
+/// The removable artifact of a command projected as a skill under `skills_root`.
+fn command_skill_file(skills_root: &Path, name: &str) -> PathBuf {
+    skills_root.join(name).join("SKILL.md")
+}
+
+#[derive(Debug, Error)]
+pub enum ProjectionError {
+    #[error("{0}")]
+    Message(String),
+    #[error("{0}")]
+    Io(#[from] io::Error),
+}
+
+/// An unexpected/global fault from [`run_machine_update`]: the fault
+/// itself, alongside the [`ProjectionEvidence`] that had already accumulated
+/// before it — preserving the real work/attribution done up to that point.
+///
+/// Expected, owned-path failures (a single target's own step failing without
+/// aborting the whole run) are represented as values inside `ProjectionEvidence`
+/// (via [`ProjectionTargetEvidence::failure`]), never as this type. Only a
+/// fault that would abort the run via an early return becomes a
+/// `ProjectionFailure`.
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub struct ProjectionFailure {
+    #[source]
+    pub error: ProjectionError,
+    pub partial: ProjectionEvidence,
+}
+
+pub fn machine_options_from_config(
+    config: &CcyncConfig,
+    dry_run: bool,
+    state_root: PathBuf,
+) -> Result<MachineUpdateOptions, ProjectionError> {
+    let (repo_root, source_root) = resolve_projection_roots(config)?;
+    let user_home = user_home()?;
+    let appdata_root = appdata_root(&user_home);
+    let selected_runtimes = selected_projection_targets_from_config(config);
+    Ok(MachineUpdateOptions {
+        state_root,
+        repo_root,
+        source_root,
+        user_home,
+        appdata_root,
+        selected_projection_targets: selected_runtimes,
+        dry_run,
+        replace: false,
+        uninstall: false,
+        // D-07: single mode — source projections always run from the canonical
+        // root (no Dev-only gate). The managed-set source swap lands in a later task.
+        include_source_projections: true,
+    })
+}
+
+/// Assemble the ordered projection source list for a machine update or sync.
+///
+/// ccync-core (the canonical plugin root) is always first and persistent.
+/// Additional installed sources (bundles, personal layer) are appended
+/// when registered — reserved for extension in the bundle-installation layer.
+pub fn collect_projection_sources(source_root: &Path) -> Vec<ProjectionSource> {
+    vec![ProjectionSource {
+        root: source_root.to_path_buf(),
+        id: "ccync".to_string(),
+        persistent: true,
+    }]
+}
+
+/// The decomposed components of a single managed plugin directory: the skill and
+/// command directory names, the agent file names (`*.agent.md`), and the MCP
+/// server names declared in the plugin's `.mcp.json`.
+///
+/// This is the projection-input materialization — a managed plugin in the cache
+/// is decomposed into the four component lists that feed `update_skills` /
+/// `update_commands` and the MCP projection. All lists are name-sorted and
+/// gracefully empty when the corresponding subtree / manifest is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginComponents {
+    pub skills: Vec<String>,
+    pub commands: Vec<String>,
+    pub agents: Vec<String>,
+    pub mcp_servers: Vec<String>,
+}
+
+/// Decompose a managed plugin directory into its component lists.
+///
+/// `skills` / `commands` are child directory names under `skills/` and
+/// `commands/`; `agents` are the `*.agent.md` file names under `agents/`;
+/// `mcp_servers` are the keys of the `servers` object in `<plugin>/.mcp.json`.
+/// Missing subtrees or manifest degrade to empty lists (no error).
+pub fn decompose_plugin(plugin_dir: &Path) -> Result<PluginComponents, ProjectionError> {
+    let skills = list_named_children(&plugin_dir.join("skills"))?;
+    let commands = list_named_children(&plugin_dir.join("commands"))?;
+    let agents = list_files_with_extension(&plugin_dir.join("agents"), "agent.md")?
+        .into_iter()
+        .filter_map(|p| p.file_name().and_then(OsStr::to_str).map(str::to_string))
+        .collect();
+    let mut mcp_servers: Vec<String> = Vec::new();
+    if let Ok(content) = fs::read_to_string(plugin_dir.join(".mcp.json")) {
+        if let Ok(v) = serde_json::from_str::<Value>(&content) {
+            if let Some(servers) = v.get("servers").and_then(Value::as_object) {
+                mcp_servers = servers.keys().cloned().collect();
+            }
+        }
+    }
+    mcp_servers.sort();
+    Ok(PluginComponents {
+        skills,
+        commands,
+        agents,
+        mcp_servers,
+    })
+}
+
+/// Canonical machine-projection entry point: runs the phases
+/// (`update_personalization`, then — when `include_source_projections` is
+/// set — `update_skills` and `update_commands`), accumulating each phase's
+/// own [`ProjectionEvidence`] into a single running total via
+/// [`extend_evidence`].
+///
+/// Each phase already attributes its own touched/removed paths directly to
+/// the owning [`ProjectionTargetId`] at the call site (or `common`). When a
+/// phase returns `Err(ProjectionFailure)`, that phase's own `partial`
+/// evidence — everything it had already attributed before the failing
+/// statement — is folded into the running total before the error is
+/// returned, so a mid-run fault carries exact attribution of the real work
+/// done up to that point.
+///
+/// No branch of `update_personalization`/`update_skills`/`update_commands`
+/// currently converts an io fault into a non-aborting, target-owned value —
+/// every fault today aborts the phase via `?`. So every phase error observed
+/// here is necessarily an unexpected/global fault, never an expected
+/// owned-path failure; there is nothing yet to represent via
+/// [`ProjectionTargetEvidence::failure`].
+///
+/// `completed_targets` is populated only on full success (every selected,
+/// parseable target) — a faulted run conservatively reports no completed
+/// targets rather than guessing.
+pub fn run_machine_update(
+    opts: &MachineUpdateOptions,
+) -> Result<ProjectionEvidence, ProjectionFailure> {
+    run_machine_update_with_scope(opts, &MachineProjectionScope::default())
+}
+
+/// Machine-projection entry point that honors a direct delegation scope.
+///
+/// Runs the same phases as [`run_machine_update`]. Machine writers withhold
+/// each write and prune that `scope` reserves for direct publication. An
+/// unavailable scope withholds every direct component write and prune.
+/// Personalization and settings always run.
+pub fn run_machine_update_with_scope(
+    opts: &MachineUpdateOptions,
+    scope: &MachineProjectionScope,
+) -> Result<ProjectionEvidence, ProjectionFailure> {
+    let pers_ctx = PersonalizationContext::new(PersonalizationUpdateOptions {
+        repo_root: opts.repo_root.clone(),
+        source_root: opts.source_root.clone(),
+        user_home: opts.user_home.clone(),
+        appdata_root: opts.appdata_root.clone(),
+        selected_projection_targets: opts.selected_projection_targets.clone(),
+        dry_run: opts.dry_run,
+        replace: opts.replace,
+        uninstall: opts.uninstall,
+    });
+    let skill_ctx = SkillContext::with_scope(
+        SkillUpdateOptions {
+            repo_root: opts.repo_root.clone(),
+            state_root: opts.state_root.clone(),
+            sources: collect_projection_sources(&opts.source_root),
+            user_home: opts.user_home.clone(),
+            selected_projection_targets: opts.selected_projection_targets.clone(),
+            dry_run: opts.dry_run,
+            replace: opts.replace,
+        },
+        scope.clone(),
+    );
+
+    let mut evidence = ProjectionEvidence::default();
+
+    match update_personalization(&pers_ctx) {
+        Ok(step_evidence) => extend_evidence(&mut evidence, step_evidence),
+        Err(failure) => {
+            extend_evidence(&mut evidence, failure.partial);
+            return Err(ProjectionFailure {
+                error: failure.error,
+                partial: evidence,
+            });
+        }
+    }
+
+    if opts.include_source_projections {
+        match update_skills(&skill_ctx) {
+            Ok(step_evidence) => extend_evidence(&mut evidence, step_evidence),
+            Err(failure) => {
+                extend_evidence(&mut evidence, failure.partial);
+                return Err(ProjectionFailure {
+                    error: failure.error,
+                    partial: evidence,
+                });
+            }
+        }
+
+        match update_commands(&skill_ctx) {
+            Ok(step_evidence) => extend_evidence(&mut evidence, step_evidence),
+            Err(failure) => {
+                extend_evidence(&mut evidence, failure.partial);
+                return Err(ProjectionFailure {
+                    error: failure.error,
+                    partial: evidence,
+                });
+            }
+        }
+    }
+
+    for target_str in &opts.selected_projection_targets {
+        if let Ok(target) = target_str.parse::<ProjectionTargetId>() {
+            evidence.completed_targets.insert(target);
+        }
+    }
+
+    Ok(evidence)
+}
+
+/// Pure enumeration of the content-independent live paths `run_machine_update`
+/// may create, write, or link into for a given runtime selection.
+///
+/// Reuses the exact same context path accessors and selection gates already used
+/// by `update_personalization`/`update_skills` (`PersonalizationContext`/
+/// `SkillContext`, `has_target`) — it performs no filesystem access and calls no
+/// `ensure_dir`, write, prune, or registry function. Per-item projected paths
+/// (individual skill/agent/command files) depend on plugin *content* that options
+/// alone cannot describe, so they are out of scope here; this enumerates only the
+/// deterministic file/link targets `run_machine_update` touches purely from
+/// `opts.selected_projection_targets` / `opts.include_source_projections` — the surfaces
+/// meaningful for a pre-write disclosure summary.
+///
+/// This planner is dry-run-agnostic: it always reports the touch set a real
+/// (non-dry) invocation would produce for the given selection, regardless of
+/// `opts.dry_run`'s actual value on the passed-in options. Some live writes
+/// are themselves only recorded by `run_machine_update` when `dry_run` is
+/// `false`, so a disclosure summary that mirrored `opts.dry_run` verbatim
+/// would under-report exactly the runs it exists to warn about; treating
+/// every call as "as if this were a real run" keeps the summary a truthful
+/// preview independent of the caller's own mode.
+///
+/// Returns `(runtime, path)` pairs sorted and de-duplicated; `runtime` is either a
+/// selected runtime key, `"agy"` for a touch gated on any selected Antigravity
+/// face, or `"common"` for a touch not gated by any single runtime.
+pub fn planned_machine_touches(opts: &MachineUpdateOptions) -> Vec<(String, PathBuf)> {
+    let personalization_ctx = PersonalizationContext::new(PersonalizationUpdateOptions {
+        repo_root: opts.repo_root.clone(),
+        source_root: opts.source_root.clone(),
+        user_home: opts.user_home.clone(),
+        appdata_root: opts.appdata_root.clone(),
+        selected_projection_targets: opts.selected_projection_targets.clone(),
+        dry_run: opts.dry_run,
+        replace: opts.replace,
+        uninstall: opts.uninstall,
+    });
+    let skill_ctx = SkillContext::new(SkillUpdateOptions {
+        repo_root: opts.repo_root.clone(),
+        state_root: opts.state_root.clone(),
+        sources: collect_projection_sources(&opts.source_root),
+        user_home: opts.user_home.clone(),
+        selected_projection_targets: opts.selected_projection_targets.clone(),
+        dry_run: opts.dry_run,
+        replace: opts.replace,
+    });
+    let any_agy = opts
+        .selected_projection_targets
+        .iter()
+        .any(|runtime| runtime.starts_with("agy-"));
+
+    let mut touches: Vec<(String, PathBuf)> = Vec::new();
+
+    // update_personalization: VS Code skills-bridge settings merge, gated on copilot.
+    if personalization_ctx.has_target("copilot") {
+        touches.push((
+            "copilot".to_string(),
+            personalization_ctx.vscode_settings_file(),
+        ));
+    }
+
+    // update_skills: the ccync source-of-truth symlinks each selected runtime
+    // family projects into its own agent home.
+    if skill_ctx.has_target("copilot") {
+        touches.push((
+            "copilot".to_string(),
+            skill_ctx.copilot_root().join("ccync"),
+        ));
+    }
+    if any_agy {
+        touches.push(("agy".to_string(), skill_ctx.ccync_source_root()));
+        touches.push(("agy".to_string(), skill_ctx.gemini_root().join("ccync")));
+        touches.push((
+            "agy".to_string(),
+            skill_ctx.antigravity_root().join("ccync"),
+        ));
+    }
+    // The AGY GUI plugin root at `~/.gemini/config/plugins/ccync` is not
+    // touched here. The engine publishes it, or retires it, and reports it in
+    // `planned_engine_touches`.
+
+    // update_skills always persists its managed-artifact lockfile marker once
+    // source projections run, regardless of which runtimes are selected.
+    if opts.include_source_projections {
+        touches.push(("common".to_string(), skill_ctx.lockfile_path()));
+    }
+
+    touches.sort();
+    touches.dedup();
+    touches
+}
+
+/// Resolve the projection roots. D-07: single mode — `repo_root` and
+/// `source_root` are both the ccync canonical plugin root (`~/.ccync/plugins/ccync`),
+/// which the canonical-root content render materializes. There is no Dev/Normal split and
+/// no ccync-core lookup, so this never errors for "missing ccync-core" — only when the
+/// home directory cannot be resolved.
+fn resolve_projection_roots(_config: &CcyncConfig) -> Result<(PathBuf, PathBuf), ProjectionError> {
+    let canonical = ccync_foundation::paths::canonical_plugin_root().ok_or_else(|| {
+        ProjectionError::Message("could not resolve canonical plugin root".into())
+    })?;
+    Ok((canonical.clone(), canonical))
+}
+
+fn user_home() -> Result<PathBuf, ProjectionError> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .ok_or_else(|| ProjectionError::Message("USERPROFILE is not set".into()))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| ProjectionError::Message("HOME is not set".into()))
+    }
+}
+
+fn appdata_root(user_home: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_home.join("AppData").join("Roaming"))
+    }
+    #[cfg(not(windows))]
+    {
+        user_home.join(".config")
+    }
+}
+
+/// Resolve the selected runtime set from `config.json` (folded from the former
+/// `install-state.json` by the data-layout flatten). Delegates to the
+/// foundation resolver ([`CcyncConfig::resolve_projection_targets`]) so the
+/// canonical (`selectedProjectionTargets`) and legacy (`selectedRuntimes`)
+/// keys are reconciled the same way everywhere. Only a wholly absent
+/// selection (neither key present, [`LegacyState::Absent`]) falls back to the
+/// full canonical target set, preserving prior projection behavior for
+/// unconfigured machines. A present-but-all-invalid selection resolves to
+/// empty instead — the foundation resolver itself applies no fallback either
+/// way; this function's fallback is scoped to the absent case only.
+fn selected_projection_targets_from_config(config: &CcyncConfig) -> Vec<String> {
+    let resolution = config.resolve_projection_targets();
+    let mut selected: Vec<String> = resolution
+        .targets
+        .iter()
+        .map(|target| target.as_str().to_string())
+        .collect();
+    if selected.is_empty() && resolution.state == LegacyState::Absent {
+        selected = CANONICAL_PROJECTION_TARGETS
+            .iter()
+            .map(|target| target.as_str().to_string())
+            .collect();
+    }
+    selected.sort();
+    selected.dedup();
+    selected
+}
+
+#[derive(Debug, Clone)]
+struct SkillContext {
+    opts: SkillUpdateOptions,
+    scope: MachineProjectionScope,
+}
+
+impl SkillContext {
+    fn new(opts: SkillUpdateOptions) -> Self {
+        Self::with_scope(opts, MachineProjectionScope::default())
+    }
+
+    fn with_scope(opts: SkillUpdateOptions, scope: MachineProjectionScope) -> Self {
+        Self { opts, scope }
+    }
+
+    fn primary_source_root(&self) -> &Path {
+        &self.opts.sources[0].root
+    }
+
+    fn copilot_root(&self) -> PathBuf {
+        self.opts.user_home.join(".copilot")
+    }
+
+    fn gemini_root(&self) -> PathBuf {
+        self.opts.user_home.join(".gemini")
+    }
+
+    fn codex_root(&self) -> PathBuf {
+        self.opts.user_home.join(".codex")
+    }
+
+    fn codex_agents_target(&self) -> PathBuf {
+        self.codex_root().join("agents")
+    }
+
+    fn antigravity_root(&self) -> PathBuf {
+        self.gemini_root().join("antigravity-cli")
+    }
+
+    fn ccync_home(&self) -> PathBuf {
+        self.opts.user_home.join(".ccync")
+    }
+
+    fn lockfile_path(&self) -> PathBuf {
+        self.opts.state_root.join("lock.json")
+    }
+
+    fn ccync_source_root(&self) -> PathBuf {
+        self.ccync_home().join("source")
+    }
+
+    fn canonical_plugin_root(&self) -> PathBuf {
+        self.ccync_home().join("build").join("render")
+    }
+
+    fn canonical_commands_root(&self) -> PathBuf {
+        self.canonical_plugin_root().join("commands")
+    }
+
+    fn agents_target(&self) -> PathBuf {
+        self.copilot_root().join("agents")
+    }
+
+    fn copilot_skills_target(&self) -> PathBuf {
+        self.copilot_root().join("skills")
+    }
+
+    fn codex_skills_target(&self) -> PathBuf {
+        self.codex_root().join("skills")
+    }
+
+    fn claude_commands_target(&self) -> PathBuf {
+        self.opts.user_home.join(".claude").join("commands")
+    }
+
+    fn workspace_skills_target(&self) -> PathBuf {
+        self.opts.repo_root.join(".agents").join("skills")
+    }
+
+    fn shared_skills_target(&self) -> PathBuf {
+        self.opts.user_home.join(".agents").join("skills")
+    }
+
+    fn opencode_root(&self) -> PathBuf {
+        self.opts.user_home.join(".config").join("opencode")
+    }
+
+    fn opencode_commands_target(&self) -> PathBuf {
+        self.opencode_root().join("commands")
+    }
+
+    fn has_target(&self, target: &str) -> bool {
+        self.opts
+            .selected_projection_targets
+            .iter()
+            .any(|rt| rt == target)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PersonalizationContext {
+    opts: PersonalizationUpdateOptions,
+}
+
+impl PersonalizationContext {
+    fn new(opts: PersonalizationUpdateOptions) -> Self {
+        Self { opts }
+    }
+
+    fn ccync_home(&self) -> PathBuf {
+        self.opts.user_home.join(".ccync")
+    }
+
+    fn gemini_root(&self) -> PathBuf {
+        self.opts.user_home.join(".gemini")
+    }
+
+    fn antigravity_root(&self) -> PathBuf {
+        self.gemini_root().join("antigravity-cli")
+    }
+
+    fn workspace_agents_root(&self) -> PathBuf {
+        self.opts.repo_root.join(".agents")
+    }
+
+    fn workspace_skills_target(&self) -> PathBuf {
+        self.workspace_agents_root().join("skills")
+    }
+
+    fn workspace_rules_target(&self) -> PathBuf {
+        self.workspace_agents_root().join("rules")
+    }
+
+    fn vscode_settings_file(&self) -> PathBuf {
+        self.opts
+            .appdata_root
+            .join("Code")
+            .join("User")
+            .join("settings.json")
+    }
+
+    fn has_target(&self, target: &str) -> bool {
+        self.opts
+            .selected_projection_targets
+            .iter()
+            .any(|value| value == target)
+    }
+
+    /// True when any Antigravity face (`agy-cli` / `agy-ide` / `agy-gui`) is selected.
+    fn has_agy_target(&self) -> bool {
+        self.opts
+            .selected_projection_targets
+            .iter()
+            .any(|value| value.starts_with("agy-"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical evidence-shaped producers.
+//
+// `update_skills`/`update_commands`/`update_personalization` return
+// `ProjectionEvidence` directly. Each touched/removed path is attributed to
+// its owning `ProjectionTargetId` right at the call site, using the same
+// context (`has_target`/selection checks) the projection logic already
+// branches on — direct attribution, not post-hoc bare-path inference.
+// `run_machine_update` is the canonical entry point that composes all three.
+// ---------------------------------------------------------------------------
+
+/// Build a [`ProjectionFailure`] carrying the evidence already accumulated
+/// before `error` occurred — the shared "partial reflects exactly the work
+/// done so far" contract every evidence-shaped producer in this module uses.
+fn fault(evidence: &ProjectionEvidence, error: ProjectionError) -> ProjectionFailure {
+    ProjectionFailure {
+        error,
+        partial: evidence.clone(),
+    }
+}
+
+/// Merge `src` into `dst` — used to combine [`ProjectionEvidence`] values
+/// already returned by an evidence-shaped helper (e.g. `write_text_with_evidence`)
+/// with the running accumulator a producer function owns.
+fn extend_evidence(dst: &mut ProjectionEvidence, src: ProjectionEvidence) {
+    dst.common.extend(src.common);
+    for (target, target_evidence) in src.by_target {
+        let entry = dst.by_target.entry(target).or_default();
+        entry.paths.extend(target_evidence.paths);
+        entry.warnings.extend(target_evidence.warnings);
+        if entry.skipped.is_none() {
+            entry.skipped = target_evidence.skipped;
+        }
+        if entry.failure.is_none() {
+            entry.failure = target_evidence.failure;
+        }
+    }
+    dst.completed_targets.extend(src.completed_targets);
+    dst.run_warnings.extend(src.run_warnings);
+}
+
+/// Fold a completed internal-scratch [`ProjectionReport`] into `evidence`,
+/// attributing every touched path directly to `owner`'s own bucket (or
+/// `common` when `owner` is `None`) — the caller already knows which
+/// target's own step just ran.
+fn merge_report_as(
+    evidence: &mut ProjectionEvidence,
+    report: &ProjectionReport,
+    owner: Option<ProjectionTargetId>,
+) {
+    for path in &report.written_files {
+        record_projection_path_as(evidence, path, ProjectionPathChange::Written, owner);
+    }
+    for path in &report.removed_paths {
+        record_projection_path_as(evidence, path, ProjectionPathChange::Removed, owner);
+    }
+    for path in &report.created_links {
+        record_projection_path_as(evidence, path, ProjectionPathChange::Linked, owner);
+    }
+    for warning in &report.warnings {
+        match owner {
+            Some(target) => evidence
+                .by_target
+                .entry(target)
+                .or_default()
+                .warnings
+                .push(warning.message.clone()),
+            None => evidence.run_warnings.push(warning.message.clone()),
+        }
+    }
+}
+
+fn record_projection_path_as(
+    evidence: &mut ProjectionEvidence,
+    path: &Path,
+    change: ProjectionPathChange,
+    owner: Option<ProjectionTargetId>,
+) {
+    let result = ProjectionPathResult {
+        path: path.to_path_buf(),
+        change,
+    };
+    match owner {
+        Some(target) => evidence
+            .by_target
+            .entry(target)
+            .or_default()
+            .paths
+            .push(result),
+        None => evidence.common.push(result),
+    }
+}
+
+/// Run one legacy report-mutating helper (`step`) against a fresh scratch
+/// [`ProjectionReport`], fold whatever it wrote into `evidence` via `owner`,
+/// then surface any fault as a [`ProjectionFailure`] carrying `evidence`
+/// (including this step's own already-merged partial work) as `partial`.
+fn record_step<T>(
+    evidence: &mut ProjectionEvidence,
+    owner: Option<ProjectionTargetId>,
+    step: impl FnOnce(&mut ProjectionReport) -> Result<T, ProjectionError>,
+) -> Result<T, ProjectionFailure> {
+    let mut block_report = ProjectionReport::default();
+    let result = step(&mut block_report);
+    merge_report_as(evidence, &block_report, owner);
+    result.map_err(|error| fault(evidence, error))
+}
+
+/// Canonical evidence-shaped skills projection entry point.
+pub fn run_update_skills(
+    opts: &SkillUpdateOptions,
+) -> Result<ProjectionEvidence, ProjectionFailure> {
+    let ctx = SkillContext::new(opts.clone());
+    update_skills(&ctx)
+}
+
+/// Canonical evidence-shaped commands projection entry point.
+pub fn run_update_commands(
+    opts: &CommandUpdateOptions,
+) -> Result<ProjectionEvidence, ProjectionFailure> {
+    let ctx = SkillContext::new(opts.clone());
+    update_commands(&ctx)
+}
+
+/// Canonical evidence-shaped personalization entry point.
+pub fn run_update_personalization(
+    opts: &PersonalizationUpdateOptions,
+) -> Result<ProjectionEvidence, ProjectionFailure> {
+    let ctx = PersonalizationContext::new(opts.clone());
+    update_personalization(&ctx)
+}
+
+/// Canonical skills projection producer — attributes each touched/removed
+/// path directly to its owning [`ProjectionTargetId`] at the call site.
+fn update_skills(ctx: &SkillContext) -> Result<ProjectionEvidence, ProjectionFailure> {
+    use std::collections::BTreeMap;
+
+    let mut evidence = ProjectionEvidence::default();
+    if ctx.scope.unavailable {
+        evidence
+            .run_warnings
+            .push(UNAVAILABLE_SCOPE_WARNING.to_string());
+    }
+
+    // Collect skills and agents from all sources in order (ccync-core first = baseline).
+    let mut skill_names: Vec<String> = Vec::new();
+    let mut skill_source_id: BTreeMap<String, String> = BTreeMap::new();
+    let mut agent_paths: Vec<PathBuf> = Vec::new();
+    let mut claude_agent_paths: Vec<PathBuf> = Vec::new();
+    let mut agent_fname_source_id: BTreeMap<String, String> = BTreeMap::new();
+
+    for src in &ctx.opts.sources {
+        let names =
+            list_named_children(&src.root.join("skills")).map_err(|e| fault(&evidence, e))?;
+        for name in names {
+            if let Some(owner) = skill_source_id.get(&name) {
+                evidence.run_warnings.push(format!(
+                    "skill '{}' from source '{}' skipped: name already claimed by source '{}'",
+                    name, src.id, owner
+                ));
+                continue;
+            }
+            skill_names.push(name.clone());
+            skill_source_id.insert(name, src.id.clone());
+        }
+        let agent_files = list_files_with_extension(&src.root.join("agents"), "agent.md")
+            .map_err(|e| fault(&evidence, e))?;
+        for path in agent_files {
+            let fname = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("")
+                .to_string();
+            if let Some(owner) = agent_fname_source_id.get(&fname) {
+                evidence.run_warnings.push(format!(
+                    "agent '{}' from source '{}' skipped: name already claimed by source '{}'",
+                    fname, src.id, owner
+                ));
+                continue;
+            }
+            agent_paths.push(path);
+            agent_fname_source_id.insert(fname, src.id.clone());
+        }
+        let claude_agent_files = list_files_with_extension(&src.root.join("agents"), ".md")
+            .map_err(|e| fault(&evidence, e))?;
+        for path in claude_agent_files {
+            let fname = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("")
+                .to_string();
+            if fname.ends_with(".agent.md") {
+                continue;
+            }
+            let raw =
+                fs::read_to_string(&path).map_err(|e| fault(&evidence, ProjectionError::Io(e)))?;
+            let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+            if !raw.starts_with("---") {
+                continue;
+            }
+            let Some(meta) = parse_agent_meta(raw) else {
+                evidence.run_warnings.push(format!(
+                    "agent '{}' from source '{}' skipped: frontmatter has no name",
+                    fname, src.id
+                ));
+                continue;
+            };
+            if meta.description.trim().is_empty() {
+                evidence.run_warnings.push(format!(
+                    "agent '{}' from source '{}' has empty description",
+                    fname, src.id
+                ));
+                continue;
+            } else if meta.description.trim_start().starts_with(['|', '>']) {
+                evidence.run_warnings.push(format!(
+                    "agent '{}' from source '{}' has description starting with '{}', which is not supported",
+                    fname,
+                    src.id,
+                    meta.description.trim_start().chars().next().unwrap()
+                ));
+                continue;
+            }
+            let stem = fname.strip_suffix(".md").unwrap_or(&fname);
+            let legacy_fname = format!("{stem}.agent.md");
+            if agent_fname_source_id.contains_key(&legacy_fname) {
+                evidence.run_warnings.push(format!(
+                    "agent '{}.md' skipped: '{}.agent.md' takes precedence",
+                    stem, stem
+                ));
+                continue;
+            }
+            claude_agent_paths.push(path);
+            agent_fname_source_id.insert(fname, src.id.clone());
+        }
+    }
+    agent_paths.extend(claude_agent_paths);
+
+    let installed_source_ids: Vec<&str> = ctx.opts.sources.iter().map(|s| s.id.as_str()).collect();
+
+    let mut registry_report = ProjectionReport::default();
+    let mut registry = ManagedArtifactRegistry::load(&ctx.lockfile_path(), &mut registry_report);
+    merge_report_as(&mut evidence, &registry_report, None);
+    registry.replace_category(MANAGED_AGENT_PATHS);
+    registry.replace_category(MANAGED_CODEX_AGENT_PATHS);
+    registry.replace_category(MANAGED_OPENCODE_AGENT_PATHS);
+    registry.replace_category(MANAGED_DISCUSS_SKILL_PATHS);
+    registry.replace_category(MANAGED_LEGACY_PATHS);
+    registry.replace_category(MANAGED_SKILL_PATHS);
+
+    // Shared ~/.agents/skills surface (codex + opencode): not uniquely owned by
+    // one target, so it attributes to `common`.
+    let shared_skills = ctx.opts.user_home.join(".agents").join("skills");
+    let should_project_shared_skills = ctx
+        .opts
+        .selected_projection_targets
+        .iter()
+        .any(|rt| rt == "codex" || rt == "opencode");
+    if should_project_shared_skills {
+        record_step(&mut evidence, None, |block_report| {
+            ensure_dir(&shared_skills, ctx.opts.dry_run)?;
+            for skill_name in &skill_names {
+                let source_id = skill_source_id
+                    .get(skill_name)
+                    .map(String::as_str)
+                    .unwrap_or("ccync");
+                let source_root = ctx
+                    .opts
+                    .sources
+                    .iter()
+                    .find(|s| s.id == source_id)
+                    .map(|s| s.root.as_path())
+                    .unwrap_or_else(|| ctx.primary_source_root());
+                let source = source_root.join("skills").join(skill_name);
+                let link = shared_skills.join(skill_name);
+                if ctx.scope.withholds(
+                    DirectDelegationComponent::Skill,
+                    SKILLS_LEGACY_WRITER,
+                    &link,
+                ) {
+                    continue;
+                }
+                let linked = ensure_dir_link(
+                    &source,
+                    &link,
+                    ctx.opts.replace,
+                    ctx.opts.dry_run,
+                    block_report,
+                )?;
+                if linked {
+                    registry.mark_with_source(MANAGED_SKILL_PATHS, &link, source_id);
+                }
+            }
+            Ok(())
+        })?;
+        if !ctx.scope.prune_withheld(
+            DirectDelegationComponent::Skill,
+            SKILLS_LEGACY_WRITER,
+            &shared_skills,
+        ) {
+            let reserved = ctx.scope.reserved_names(
+                DirectDelegationComponent::Skill,
+                SKILLS_LEGACY_WRITER,
+                &shared_skills,
+            );
+            let keep = keep_names_with(
+                &skill_names.iter().map(String::as_str).collect::<Vec<_>>(),
+                &reserved,
+            );
+            let step_evidence = prune_stale_links(
+                &shared_skills,
+                keep,
+                ctx.opts.dry_run,
+                &registry,
+                &ctx.opts.sources,
+                None,
+            )
+            .map_err(|e| fault(&evidence, e))?;
+            extend_evidence(&mut evidence, step_evidence);
+        }
+    } else if !ctx.scope.prune_withheld(
+        DirectDelegationComponent::Skill,
+        SKILLS_LEGACY_WRITER,
+        &shared_skills,
+    ) {
+        let reserved = ctx.scope.reserved_names(
+            DirectDelegationComponent::Skill,
+            SKILLS_LEGACY_WRITER,
+            &shared_skills,
+        );
+        let step_evidence = prune_stale_links(
+            &shared_skills,
+            reserved.iter().map(String::as_str),
+            ctx.opts.dry_run,
+            &registry,
+            &ctx.opts.sources,
+            None,
+        )
+        .map_err(|e| fault(&evidence, e))?;
+        extend_evidence(&mut evidence, step_evidence);
+    }
+
+    if ctx
+        .opts
+        .selected_projection_targets
+        .iter()
+        .any(|rt| rt == "copilot")
+    {
+        let ccync_root = ctx.copilot_root().join("ccync");
+        let linked = record_step(
+            &mut evidence,
+            Some(ProjectionTargetId::Copilot),
+            |block_report| {
+                ensure_dir(&ctx.ccync_home(), ctx.opts.dry_run)?;
+                ensure_dir_link(
+                    &ctx.ccync_home(),
+                    &ccync_root,
+                    ctx.opts.replace,
+                    ctx.opts.dry_run,
+                    block_report,
+                )
+            },
+        )?;
+        if linked && !ctx.opts.dry_run {
+            registry.mark(MANAGED_SOURCE_LINK_PATHS, &ccync_root);
+        }
+    }
+    // `~/.ccync` source-link surface shared by every Antigravity face — not
+    // uniquely owned by one target, so it attributes to `common`. gemini-cli
+    // is retired; this link is gated on agy-* selection alone.
+    let should_keep_source_link = ctx
+        .opts
+        .selected_projection_targets
+        .iter()
+        .any(|rt| rt.starts_with("agy-"));
+    if should_keep_source_link {
+        record_step(&mut evidence, None, |block_report| {
+            ensure_dir(&ctx.ccync_home(), ctx.opts.dry_run)?;
+            ensure_dir_link(
+                &ctx.opts.repo_root,
+                &ctx.ccync_source_root(),
+                ctx.opts.replace,
+                ctx.opts.dry_run,
+                block_report,
+            )
+        })?;
+    }
+    // `~/.gemini/ccync` source link — shared by every Antigravity face, not
+    // uniquely owned by one target, so it attributes to `common`.
+    if ctx
+        .opts
+        .selected_projection_targets
+        .iter()
+        .any(|rt| rt.starts_with("agy-"))
+    {
+        let ccync_root = ctx.gemini_root().join("ccync");
+        let linked = record_step(&mut evidence, None, |block_report| {
+            ensure_dir_link(
+                &ctx.ccync_source_root(),
+                &ccync_root,
+                ctx.opts.replace,
+                ctx.opts.dry_run,
+                block_report,
+            )
+        })?;
+        if linked && !ctx.opts.dry_run {
+            registry.mark(MANAGED_SOURCE_LINK_PATHS, &ccync_root);
+        }
+    }
+    // Antigravity whole-plugin junction: shared by agy-cli/agy-ide/agy-gui, not
+    // distinguishable to one face from this path alone — folds into `common`.
+    if ctx
+        .opts
+        .selected_projection_targets
+        .iter()
+        .any(|rt| rt.starts_with("agy-"))
+    {
+        let ccync_root = ctx.antigravity_root().join("ccync");
+        let linked = record_step(&mut evidence, None, |block_report| {
+            ensure_dir_link(
+                &ctx.ccync_source_root(),
+                &ccync_root,
+                ctx.opts.replace,
+                ctx.opts.dry_run,
+                block_report,
+            )
+        })?;
+        if linked && !ctx.opts.dry_run {
+            registry.mark(MANAGED_SOURCE_LINK_PATHS, &ccync_root);
+        }
+    }
+
+    // --- Antigravity GUI (agy-gui) native projection ---
+    // agy-gui now uses the same whole-plugin junction mechanism as
+    // agy-cli/agy-ide (the third `AgyProjection` target, `gui_target`)
+    // instead of the former per-skill decomposition + dedicated MCP writer.
+    // The old single-skill links retire through the registry prune below;
+    // this block owns no MANAGED_* registry bucket of its own for the
+    // junction itself — matching the sibling `~/.gemini/ccync` / Antigravity
+    // `ccync` junction blocks above, which are likewise created only on
+    // selection and not registry-pruned once created.
+    {
+        let agy_gui_skills = ctx
+            .opts
+            .user_home
+            .join(".gemini")
+            .join("antigravity")
+            .join("skills");
+        if !ctx.scope.prune_withheld(
+            DirectDelegationComponent::Skill,
+            SKILLS_LEGACY_WRITER,
+            &agy_gui_skills,
+        ) {
+            let reserved = ctx.scope.reserved_names(
+                DirectDelegationComponent::Skill,
+                SKILLS_LEGACY_WRITER,
+                &agy_gui_skills,
+            );
+            let step_evidence = prune_stale_links(
+                &agy_gui_skills,
+                reserved.iter().map(String::as_str),
+                ctx.opts.dry_run,
+                &registry,
+                &ctx.opts.sources,
+                Some(ProjectionTargetId::AgyGui),
+            )
+            .map_err(|e| fault(&evidence, e))?;
+            extend_evidence(&mut evidence, step_evidence);
+        }
+
+        let gui_target = ctx
+            .opts
+            .user_home
+            .join(".gemini")
+            .join("config")
+            .join("plugins")
+            .join("ccync");
+
+        // The GUI root is not published here. The engine's canonical phase
+        // publishes it directly and retires it, or publishes it as the fallback
+        // when that direct publication fails. This phase only removes a
+        // link-shaped root once the face is deselected.
+        if !ctx.has_target("agy-gui") {
+            // Link-shaped roots only, deliberately. A root published as a
+            // directory copy is left standing here: a selection list narrower
+            // than the user's configured set is not proof that the user wants
+            // the missing faces deleted, and the same list is what scopes a
+            // partial run. Removing a published copy is `ccync uninstall`'s
+            // job alone (`AgyProjection::remove`). Recorded as a deviation
+            // against the plan requirement that asked for deselection to
+            // remove all three roots in whichever shape they were published.
+            let ownership = AgyRootOwnership::from_lockfile(&ctx.lockfile_path());
+            record_step(
+                &mut evidence,
+                Some(ProjectionTargetId::AgyGui),
+                |block_report| {
+                    if ccync_foundation::platform::is_symlink_or_junction(&gui_target)
+                        && !ctx.scope.withholds(
+                            DirectDelegationComponent::Skill,
+                            SKILLS_LEGACY_WRITER,
+                            &gui_target,
+                        )
+                    {
+                        if !ctx.opts.dry_run {
+                            ccync_foundation::platform::remove_dir_link(&gui_target)?;
+                            // Release the row with the link, never after: a row
+                            // whose artifact is gone is standing
+                            // `remove_dir_all` authority over whatever later
+                            // occupies this path, and nothing else collects it
+                            // — `persist` re-serializes this category verbatim
+                            // from disk. A surviving directory copy keeps its
+                            // row on purpose; that row is the proof
+                            // `ccync uninstall` needs to remove it later.
+                            ownership.forget_now(&gui_target, ctx.opts.dry_run)?;
+                        }
+                        block_report.removed_paths.push(gui_target.clone());
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+    }
+
+    if ctx.has_target("copilot") {
+        record_step(
+            &mut evidence,
+            Some(ProjectionTargetId::Copilot),
+            |_block_report| {
+                let agents_target = ctx.agents_target();
+                ensure_dir(&agents_target, ctx.opts.dry_run)?;
+                for agent_path in &agent_paths {
+                    let source_fname =
+                        agent_path
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .ok_or_else(|| {
+                                ProjectionError::Message("invalid agent file name".into())
+                            })?;
+                    let fname = if agent_path
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(|name| !name.ends_with(".agent.md"))
+                    {
+                        format!(
+                            "{}.agent.md",
+                            agent_path
+                                .file_stem()
+                                .and_then(OsStr::to_str)
+                                .unwrap_or("agent")
+                        )
+                    } else {
+                        source_fname.to_string()
+                    };
+                    let target = agents_target.join(&fname);
+                    if ctx.scope.withholds(
+                        DirectDelegationComponent::Agent,
+                        SKILLS_LEGACY_WRITER,
+                        &target,
+                    ) {
+                        continue;
+                    }
+                    let source_id = agent_fname_source_id
+                        .get(source_fname)
+                        .map(String::as_str)
+                        .unwrap_or("ccync");
+                    let prior_owner = registry.owning_source_of(&target);
+                    if target.exists()
+                        && (prior_owner != Some(source_id) || !registry.is_managed(&target))
+                    {
+                        _block_report.warnings.push(ProjectionWarning {
+                            message: format!(
+                                "preserved unowned Copilot agent: {}",
+                                target.display()
+                            ),
+                        });
+                        continue;
+                    }
+                    let raw = fs::read_to_string(agent_path)?;
+                    let raw = if source_fname.ends_with(".agent.md") {
+                        raw
+                    } else {
+                        let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+                        remove_frontmatter_key(raw, "model")
+                    };
+                    write_text(&target, &raw, ctx.opts.dry_run)?;
+                    registry.mark_with_source(MANAGED_AGENT_PATHS, &target, source_id);
+                }
+                Ok(())
+            },
+        )?;
+        let copilot_agent_names: Vec<String> = agent_paths
+            .iter()
+            .filter_map(|path| {
+                let name = path.file_name().and_then(OsStr::to_str)?;
+                if name.ends_with(".agent.md") {
+                    Some(name.to_string())
+                } else {
+                    Some(format!("{}.agent.md", path.file_stem()?.to_string_lossy()))
+                }
+            })
+            .collect();
+        if !ctx.scope.prune_withheld(
+            DirectDelegationComponent::Agent,
+            SKILLS_LEGACY_WRITER,
+            &ctx.agents_target(),
+        ) {
+            let reserved = ctx.scope.reserved_names(
+                DirectDelegationComponent::Agent,
+                SKILLS_LEGACY_WRITER,
+                &ctx.agents_target(),
+            );
+            let keep = keep_names_with(
+                &copilot_agent_names
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                &reserved,
+            );
+            let step_evidence = prune_stale_links(
+                &ctx.agents_target(),
+                keep,
+                ctx.opts.dry_run,
+                &registry,
+                &ctx.opts.sources,
+                Some(ProjectionTargetId::Copilot),
+            )
+            .map_err(|e| fault(&evidence, e))?;
+            extend_evidence(&mut evidence, step_evidence);
+        }
+    }
+
+    if ctx.has_target("codex") {
+        let mut codex_toml_names: Vec<String> = Vec::new();
+        record_step(
+            &mut evidence,
+            Some(ProjectionTargetId::Codex),
+            |_block_report| {
+                let codex_agents = ctx.codex_agents_target();
+                ensure_dir(&codex_agents, ctx.opts.dry_run)?;
+
+                for agent_path in &agent_paths {
+                    let source_fname = agent_path.file_name().and_then(OsStr::to_str).unwrap_or("");
+                    let is_claude_shape = !source_fname.ends_with(".agent.md");
+                    let raw = fs::read_to_string(agent_path)?;
+                    let raw = if is_claude_shape {
+                        raw.strip_prefix('\u{feff}').unwrap_or(&raw)
+                    } else {
+                        &raw
+                    };
+                    if let Some(meta) = parse_agent_meta(&raw) {
+                        if is_claude_shape
+                            && raw
+                                .lines()
+                                .any(|line| line.trim_start().starts_with("tools:"))
+                        {
+                            _block_report.warnings.push(ProjectionWarning {
+                                message: format!(
+                                    "agent '{}' tool restrictions are unsupported on Codex and were not projected",
+                                    source_fname
+                                ),
+                            });
+                        }
+                        let toml = codex_agent::serialize_codex_toml(
+                            &meta,
+                            if is_claude_shape {
+                                ""
+                            } else {
+                                meta.model.as_deref().unwrap_or("")
+                            },
+                            if is_claude_shape {
+                                None
+                            } else {
+                                meta.reasoning_effort.as_deref()
+                            },
+                            tool_map::invocation_mode_to_codex_sandbox(
+                                tool_map::InvocationMode::Consult,
+                            ),
+                        );
+                        let toml_fname = format!("{}.toml", meta.name);
+                        let target = codex_agents.join(&toml_fname);
+                        if ctx.scope.withholds(
+                            DirectDelegationComponent::Agent,
+                            SKILLS_LEGACY_WRITER,
+                            &target,
+                        ) {
+                            continue;
+                        }
+                        let source_id = agent_fname_source_id
+                            .get(source_fname)
+                            .map(String::as_str)
+                            .unwrap_or("ccync");
+                        let prior_owner = registry.owning_source_of(&target);
+                        if target.exists()
+                            && (prior_owner != Some(source_id) || !registry.is_managed(&target))
+                        {
+                            _block_report.warnings.push(ProjectionWarning {
+                                message: format!(
+                                    "preserved unowned Codex agent: {}",
+                                    target.display()
+                                ),
+                            });
+                            continue;
+                        }
+                        write_text(&target, &toml, ctx.opts.dry_run)?;
+                        registry.mark_with_source(MANAGED_CODEX_AGENT_PATHS, &target, source_id);
+                        codex_toml_names.push(toml_fname);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if !ctx.scope.prune_withheld(
+            DirectDelegationComponent::Agent,
+            SKILLS_LEGACY_WRITER,
+            &ctx.codex_agents_target(),
+        ) {
+            let reserved = ctx.scope.reserved_names(
+                DirectDelegationComponent::Agent,
+                SKILLS_LEGACY_WRITER,
+                &ctx.codex_agents_target(),
+            );
+            let keep = keep_names_with(
+                &codex_toml_names
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                &reserved,
+            );
+            let step_evidence = prune_stale_links(
+                &ctx.codex_agents_target(),
+                keep,
+                ctx.opts.dry_run,
+                &registry,
+                &ctx.opts.sources,
+                Some(ProjectionTargetId::Codex),
+            )
+            .map_err(|e| fault(&evidence, e))?;
+            extend_evidence(&mut evidence, step_evidence);
+        }
+    }
+
+    if !ctx
+        .opts
+        .selected_projection_targets
+        .iter()
+        .any(|rt| rt == "opencode")
+    {
+        record_step(&mut evidence, None, |block_report| {
+            registry.persist(&installed_source_ids, ctx.opts.dry_run, block_report)
+        })?;
+        return Ok(evidence);
+    }
+
+    let mut opencode_agent_names: Vec<String> = Vec::new();
+    record_step(
+        &mut evidence,
+        Some(ProjectionTargetId::Opencode),
+        |block_report| {
+            let opencode_agents = ctx.opencode_root().join("agents");
+
+            // Collect every desired target's name/content/owning-source up front,
+            // before any collision check runs, so the keep set a later prune pass
+            // reads back is derived from the full desired set — not just the
+            // subset that happened to pass this run's ownership guard.
+            let planned: Vec<(PathBuf, String, &str)> = agent_paths
+                .iter()
+                .map(|agent_path| -> Result<_, ProjectionError> {
+                    let source_fname = agent_path.file_name().and_then(OsStr::to_str).unwrap_or("");
+                    let raw = fs::read_to_string(agent_path)?;
+                    let raw = if source_fname.ends_with(".agent.md") {
+                        &raw
+                    } else {
+                        raw.strip_prefix('\u{feff}').unwrap_or(&raw)
+                    };
+                    let frontmatter = parse_frontmatter(&raw);
+                    let name = agent_path
+                        .file_stem()
+                        .and_then(OsStr::to_str)
+                        .unwrap_or("agent")
+                        .trim_end_matches(".agent");
+                    let target = opencode_agents.join(format!("{name}.md"));
+                    let content =
+                        render_opencode_agent(name, &frontmatter, &strip_frontmatter(&raw));
+                    let fname_key = source_fname;
+                    let source_id = agent_fname_source_id
+                        .get(fname_key)
+                        .map(String::as_str)
+                        .unwrap_or("ccync");
+                    Ok((target, content, source_id))
+                })
+                .collect::<Result<_, _>>()?;
+
+            opencode_agent_names = planned
+                .iter()
+                .filter_map(|(target, _, _)| {
+                    target.file_name().and_then(OsStr::to_str).map(String::from)
+                })
+                .collect();
+
+            for (target, content, source_id) in planned {
+                if ctx.scope.withholds(
+                    DirectDelegationComponent::Agent,
+                    SKILLS_LEGACY_WRITER,
+                    &target,
+                ) {
+                    continue;
+                }
+                // Reject absent-source ownership first: a target this run's
+                // registry attributes to a source that is not part of the
+                // current installed set is foreign to this invocation and must
+                // not be touched, regardless of on-disk content.
+                let owning_source_is_foreign = registry
+                    .owning_source_of(&target)
+                    .map(|src| !installed_source_ids.contains(&src))
+                    .unwrap_or(false);
+                if owning_source_is_foreign {
+                    block_report.warnings.push(ProjectionWarning {
+                        message: format!(
+                            "preserved foreign-owned OpenCode agent: {}",
+                            target.display()
+                        ),
+                    });
+                    continue;
+                }
+                // Only an existing target proven ccync-owned — either by content
+                // header or by prior registry membership — may be overwritten.
+                // An unproven same-name target is a genuine collision: warn and
+                // skip it rather than clobber it.
+                if target.exists()
+                    && !is_ccync_managed_file(&target)
+                    && !registry.is_managed(&target)
+                {
+                    block_report.warnings.push(ProjectionWarning {
+                        message: format!("preserved user-owned path: {}", target.display()),
+                    });
+                    continue;
+                }
+                write_text_atomically_with_report(
+                    &target,
+                    &content,
+                    ctx.opts.dry_run,
+                    block_report,
+                )?;
+                registry.mark_with_source(MANAGED_OPENCODE_AGENT_PATHS, &target, source_id);
+            }
+            Ok(())
+        },
+    )?;
+    let opencode_agents_root = ctx.opencode_root().join("agents");
+    if !ctx.scope.prune_withheld(
+        DirectDelegationComponent::Agent,
+        SKILLS_LEGACY_WRITER,
+        &opencode_agents_root,
+    ) {
+        let reserved = ctx.scope.reserved_names(
+            DirectDelegationComponent::Agent,
+            SKILLS_LEGACY_WRITER,
+            &opencode_agents_root,
+        );
+        let keep = keep_names_with(
+            &opencode_agent_names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            &reserved,
+        );
+        let step_evidence = prune_stale_links(
+            &opencode_agents_root,
+            keep,
+            ctx.opts.dry_run,
+            &registry,
+            &ctx.opts.sources,
+            Some(ProjectionTargetId::Opencode),
+        )
+        .map_err(|e| fault(&evidence, e))?;
+        extend_evidence(&mut evidence, step_evidence);
+    }
+
+    record_step(
+        &mut evidence,
+        Some(ProjectionTargetId::Copilot),
+        |block_report| {
+            let copilot_skills_root = ctx.copilot_root().join("skills");
+            if ctx.scope.withholds_tree(&copilot_skills_root) {
+                return Ok(());
+            }
+            remove_if_ccync_owned_dir(
+                &copilot_skills_root,
+                ctx.opts.dry_run,
+                block_report,
+                &registry,
+            )
+        },
+    )?;
+    // Legacy cleanup: `gemini-cli` is retired and no longer a selectable
+    // target (see `crates/ccync-foundation/src/target.rs`), so this step is
+    // unconditional rather than target-attributed — same pattern as the
+    // Antigravity legacy-skills cleanup immediately below.
+    record_step(&mut evidence, None, |block_report| {
+        let gemini_skills_root = ctx.gemini_root().join("skills");
+        if ctx.scope.withholds_tree(&gemini_skills_root) {
+            return Ok(());
+        }
+        remove_if_ccync_owned_dir(
+            &gemini_skills_root,
+            ctx.opts.dry_run,
+            block_report,
+            &registry,
+        )
+    })?;
+    record_step(
+        &mut evidence,
+        Some(ProjectionTargetId::Codex),
+        |block_report| {
+            let codex_skills_root = ctx.codex_root().join("skills");
+            if ctx.scope.withholds_tree(&codex_skills_root) {
+                return Ok(());
+            }
+            remove_if_ccync_owned_dir(
+                &codex_skills_root,
+                ctx.opts.dry_run,
+                block_report,
+                &registry,
+            )
+        },
+    )?;
+    record_step(&mut evidence, None, |block_report| {
+        let antigravity_skills_root = ctx.antigravity_root().join("skills");
+        if ctx.scope.withholds_tree(&antigravity_skills_root) {
+            return Ok(());
+        }
+        remove_if_ccync_owned_dir(
+            &antigravity_skills_root,
+            ctx.opts.dry_run,
+            block_report,
+            &registry,
+        )
+    })?;
+
+    record_step(&mut evidence, None, |block_report| {
+        registry.persist(&installed_source_ids, ctx.opts.dry_run, block_report)
+    })?;
+    Ok(evidence)
+}
+
+/// Canonical commands projection producer — attributes each touched path
+/// directly to its owning [`ProjectionTargetId`] at the call site. Calls the
+/// support-module evidence-shaped prune helpers directly where they exist.
+fn update_commands(ctx: &SkillContext) -> Result<ProjectionEvidence, ProjectionFailure> {
+    let mut evidence = ProjectionEvidence::default();
+    if ctx.scope.unavailable {
+        evidence
+            .run_warnings
+            .push(UNAVAILABLE_SCOPE_WARNING.to_string());
+    }
+
+    let commands_root = ctx.primary_source_root().join("commands");
+    let canonical_commands_root = ctx.canonical_commands_root();
+    let command_dirs = list_command_dirs(&commands_root).map_err(|e| fault(&evidence, e))?;
+    let flat_command_files =
+        list_flat_command_files(&commands_root).map_err(|e| fault(&evidence, e))?;
+    let nested_command_files =
+        list_nested_command_files(&commands_root).map_err(|e| fault(&evidence, e))?;
+    for path in nested_command_files {
+        let relative = path.strip_prefix(&commands_root).unwrap_or(&path);
+        let command_name = relative
+            .with_extension("")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let reason = CommandSkillUnsupportedReason::NamespacedCommand;
+        for (target_name, target) in [
+            ("claude", ProjectionTargetId::Claude),
+            ("codex", ProjectionTargetId::Codex),
+            ("copilot", ProjectionTargetId::Copilot),
+            ("opencode", ProjectionTargetId::Opencode),
+            ("agy-cli", ProjectionTargetId::AgyCli),
+            ("agy-ide", ProjectionTargetId::AgyIde),
+            ("agy-gui", ProjectionTargetId::AgyGui),
+        ] {
+            if ctx.has_target(target_name) {
+                evidence.by_target.entry(target).or_default().failure =
+                    Some(ProjectionExpectedFailure {
+                        path: Some(path.clone()),
+                        reason: format!(
+                            "namespaced command '{command_name}' was not published: {reason}"
+                        ),
+                    });
+            }
+        }
+    }
+    let installed_source_ids: Vec<&str> = ctx.opts.sources.iter().map(|s| s.id.as_str()).collect();
+
+    let mut registry_report = ProjectionReport::default();
+    let mut registry = ManagedArtifactRegistry::load(&ctx.lockfile_path(), &mut registry_report);
+    merge_report_as(&mut evidence, &registry_report, None);
+    if !command_dirs.is_empty() || !flat_command_files.is_empty() || ctx.lockfile_path().is_file() {
+        registry.replace_category(MANAGED_COMMAND_PATHS);
+    }
+
+    ensure_dir(&canonical_commands_root, ctx.opts.dry_run).map_err(|e| fault(&evidence, e))?;
+    if ctx.has_target("opencode") {
+        ensure_dir(&ctx.opencode_commands_target(), ctx.opts.dry_run)
+            .map_err(|e| fault(&evidence, e))?;
+    }
+
+    let directory_names = command_dirs
+        .iter()
+        .filter_map(|dir| dir.file_name().and_then(OsStr::to_str))
+        .collect::<Vec<_>>();
+    let mut active_name_storage = directory_names
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    for file in &flat_command_files {
+        let Some(name) = file.file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if directory_names.contains(&name) {
+            evidence.run_warnings.push(format!(
+                "command '{name}.md' skipped: directory command takes precedence"
+            ));
+        } else {
+            active_name_storage.push(name.to_string());
+        }
+    }
+    active_name_storage.sort();
+    active_name_storage.dedup();
+    let active_names = active_name_storage
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    for command_dir in &command_dirs {
+        let name = command_dir
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                fault(
+                    &evidence,
+                    ProjectionError::Message("invalid command directory name".into()),
+                )
+            })?;
+        let canonical_command_dir = canonical_commands_root.join(name);
+        let rendered_source = bake_command_content(command_dir, &ctx.opts.repo_root)
+            .map_err(|e| fault(&evidence, e))?;
+
+        let conversion_supported =
+            !reject_unsupported_command_skill(name, &rendered_source, ctx, &mut evidence);
+
+        // Canonical bake + stale worktree cleanup: not owned by one runtime target.
+        record_step(&mut evidence, None, |block_report| {
+            ensure_dir(&canonical_command_dir, ctx.opts.dry_run)?;
+            let template_path = command_dir.join("SKILL.template.md");
+            let baked_skill = canonical_command_dir.join("SKILL.md");
+            if write_text(&baked_skill, &rendered_source, ctx.opts.dry_run)? {
+                block_report.written_files.push(baked_skill.clone());
+            }
+            registry.mark(MANAGED_COMMAND_PATHS, &baked_skill);
+
+            if template_path.is_file() {
+                let stale_worktree_bake = command_dir.join("SKILL.md");
+                if stale_worktree_bake.is_file() {
+                    if !ctx.opts.dry_run {
+                        fs::remove_file(&stale_worktree_bake)?;
+                    }
+                    block_report.removed_paths.push(stale_worktree_bake);
+                }
+            }
+            Ok(())
+        })?;
+
+        project_command_targets(
+            name,
+            &rendered_source,
+            ctx,
+            &mut evidence,
+            &mut registry,
+            conversion_supported,
+        )?;
+    }
+
+    for command_file in &flat_command_files {
+        let name = command_file
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                fault(
+                    &evidence,
+                    ProjectionError::Message("invalid flat command file name".into()),
+                )
+            })?;
+        if directory_names.contains(&name) {
+            continue;
+        }
+        let rendered_source = fs::read_to_string(command_file)
+            .map_err(ProjectionError::from)
+            .map_err(|e| fault(&evidence, e))?
+            .replace("{{CCYNC_ROOT}}", &ctx.opts.repo_root.display().to_string());
+        let conversion_supported =
+            !reject_unsupported_command_skill(name, &rendered_source, ctx, &mut evidence);
+        project_command_targets(
+            name,
+            &rendered_source,
+            ctx,
+            &mut evidence,
+            &mut registry,
+            conversion_supported,
+        )?;
+    }
+
+    let command_skill_cleanup: [(PathBuf, Option<ProjectionTargetId>); 2] = [
+        (
+            ctx.copilot_skills_target(),
+            Some(ProjectionTargetId::Copilot),
+        ),
+        (ctx.shared_skills_target(), None),
+    ];
+    for (root, owner) in command_skill_cleanup {
+        if ctx.scope.prune_withheld(
+            DirectDelegationComponent::CommandSkill,
+            COMMANDS_LEGACY_WRITER,
+            &root,
+        ) {
+            continue;
+        }
+        let reserved = ctx.scope.reserved_names(
+            DirectDelegationComponent::CommandSkill,
+            COMMANDS_LEGACY_WRITER,
+            &root,
+        );
+        let keep = keep_names_with(&active_names, &reserved);
+        let step_evidence =
+            prune_stale_command_skill_dirs(&root, &keep, ctx.opts.dry_run, &registry, owner)
+                .map_err(|e| fault(&evidence, e))?;
+        extend_evidence(&mut evidence, step_evidence);
+    }
+
+    fn project_command_targets(
+        name: &str,
+        rendered_source: &str,
+        ctx: &SkillContext,
+        mut evidence: &mut ProjectionEvidence,
+        registry: &mut ManagedArtifactRegistry,
+        conversion_supported: bool,
+    ) -> Result<(), ProjectionFailure> {
+        // Copilot command-skill.
+        if conversion_supported
+            && ctx
+                .opts
+                .selected_projection_targets
+                .iter()
+                .any(|rt| rt == "copilot")
+        {
+            record_step(
+                &mut evidence,
+                Some(ProjectionTargetId::Copilot),
+                |block_report| {
+                    if ctx.scope.withholds(
+                        DirectDelegationComponent::CommandSkill,
+                        COMMANDS_LEGACY_WRITER,
+                        &command_skill_file(&ctx.copilot_skills_target(), name),
+                    ) {
+                        return Ok(());
+                    }
+                    if let Some(skill_file) = write_command_skill(
+                        &ctx.copilot_skills_target(),
+                        name,
+                        &ensure_name_frontmatter(rendered_source, name),
+                        ctx.opts.dry_run,
+                        block_report,
+                        &registry,
+                    )? {
+                        registry.mark(MANAGED_COMMAND_PATHS, &skill_file);
+                    }
+                    Ok(())
+                },
+            )?;
+        } else if conversion_supported
+            && !ctx.scope.withholds(
+                DirectDelegationComponent::CommandSkill,
+                COMMANDS_LEGACY_WRITER,
+                &command_skill_file(&ctx.copilot_skills_target(), name),
+            )
+        {
+            remove_ccync_command_skill(
+                &ctx.copilot_skills_target(),
+                name,
+                &ctx.opts.repo_root,
+                &registry,
+                ctx.opts.dry_run,
+                &mut evidence,
+                Some(ProjectionTargetId::Copilot),
+            )
+            .map_err(|e| fault(&evidence, e))?;
+        }
+
+        // Codex shared command-skill (`~/.agents/skills`) — always drop the
+        // legacy wrong-target `~/.codex/skills` link first.
+        let codex_legacy_link = ctx.codex_skills_target().join(name);
+        if !ctx.scope.withholds(
+            DirectDelegationComponent::CommandSkill,
+            COMMANDS_LEGACY_WRITER,
+            &codex_legacy_link,
+        ) {
+            remove_link_if_present(
+                &codex_legacy_link,
+                ctx.opts.dry_run,
+                &mut evidence,
+                Some(ProjectionTargetId::Codex),
+            )
+            .map_err(|e| fault(&evidence, e))?;
+        }
+        if conversion_supported
+            && ctx
+                .opts
+                .selected_projection_targets
+                .iter()
+                .any(|rt| rt == "codex")
+        {
+            record_step(&mut evidence, None, |block_report| {
+                if ctx.scope.withholds(
+                    DirectDelegationComponent::CommandSkill,
+                    COMMANDS_LEGACY_WRITER,
+                    &command_skill_file(&ctx.shared_skills_target(), name),
+                ) {
+                    return Ok(());
+                }
+                if let Some(skill_file) = write_command_skill(
+                    &ctx.shared_skills_target(),
+                    name,
+                    &ensure_name_frontmatter(rendered_source, name),
+                    ctx.opts.dry_run,
+                    block_report,
+                    &registry,
+                )? {
+                    registry.mark(MANAGED_COMMAND_PATHS, &skill_file);
+                }
+                Ok(())
+            })?;
+        } else if conversion_supported
+            && !ctx.scope.withholds(
+                DirectDelegationComponent::CommandSkill,
+                COMMANDS_LEGACY_WRITER,
+                &command_skill_file(&ctx.shared_skills_target(), name),
+            )
+        {
+            remove_ccync_command_skill(
+                &ctx.shared_skills_target(),
+                name,
+                &ctx.opts.repo_root,
+                &registry,
+                ctx.opts.dry_run,
+                &mut evidence,
+                None,
+            )
+            .map_err(|e| fault(&evidence, e))?;
+        }
+
+        let antigravity_link = ctx.antigravity_root().join("skills").join(name);
+        if !ctx.scope.withholds(
+            DirectDelegationComponent::CommandSkill,
+            COMMANDS_LEGACY_WRITER,
+            &antigravity_link,
+        ) {
+            remove_link_if_present(&antigravity_link, ctx.opts.dry_run, &mut evidence, None)
+                .map_err(|e| fault(&evidence, e))?;
+        }
+        let workspace_link = ctx.workspace_skills_target().join(name);
+        if !ctx.scope.withholds(
+            DirectDelegationComponent::CommandSkill,
+            COMMANDS_LEGACY_WRITER,
+            &workspace_link,
+        ) {
+            remove_link_if_present(&workspace_link, ctx.opts.dry_run, &mut evidence, None)
+                .map_err(|e| fault(&evidence, e))?;
+        }
+
+        let frontmatter = parse_frontmatter(rendered_source);
+        let body = strip_frontmatter(rendered_source);
+
+        let claude_target = ctx.claude_commands_target().join(format!("{name}.md"));
+        if !ctx.scope.withholds(
+            DirectDelegationComponent::Command,
+            COMMANDS_LEGACY_WRITER,
+            &claude_target,
+        ) {
+            remove_managed_file_if_present(
+                &claude_target,
+                ctx.opts.dry_run,
+                &mut evidence,
+                Some(ProjectionTargetId::Claude),
+                &registry,
+            )
+            .map_err(|e| fault(&evidence, e))?;
+        }
+
+        let opencode_target = ctx.opencode_commands_target().join(format!("{name}.md"));
+        let opencode_withheld = ctx.scope.withholds(
+            DirectDelegationComponent::Command,
+            COMMANDS_LEGACY_WRITER,
+            &opencode_target,
+        );
+        if !opencode_withheld
+            && ctx
+                .opts
+                .selected_projection_targets
+                .iter()
+                .any(|rt| rt == "opencode")
+        {
+            let step_evidence = write_text_with_evidence(
+                &opencode_target,
+                &render_opencode_command(name, &frontmatter, &body),
+                ctx.opts.dry_run,
+                Some(ProjectionTargetId::Opencode),
+            )
+            .map_err(|e| fault(&evidence, e))?;
+            extend_evidence(&mut evidence, step_evidence);
+            registry.mark(MANAGED_COMMAND_PATHS, &opencode_target);
+        } else if !opencode_withheld {
+            remove_managed_file_if_present(
+                &opencode_target,
+                ctx.opts.dry_run,
+                &mut evidence,
+                Some(ProjectionTargetId::Opencode),
+                &registry,
+            )
+            .map_err(|e| fault(&evidence, e))?;
+        }
+        Ok(())
+    }
+
+    fn reject_unsupported_command_skill(
+        name: &str,
+        rendered_source: &str,
+        ctx: &SkillContext,
+        evidence: &mut ProjectionEvidence,
+    ) -> bool {
+        let input = DirectCommandSkillInput {
+            name: name.to_string(),
+            body: strip_frontmatter(rendered_source),
+        };
+        let Some(reason) = input.unsupported_reason() else {
+            return false;
+        };
+        let targets = [
+            ("codex", ProjectionTargetId::Codex),
+            ("copilot", ProjectionTargetId::Copilot),
+            ("agy-cli", ProjectionTargetId::AgyCli),
+            ("agy-ide", ProjectionTargetId::AgyIde),
+            ("agy-gui", ProjectionTargetId::AgyGui),
+        ];
+        for (target_name, target) in targets {
+            if ctx.has_target(target_name) {
+                evidence.by_target.entry(target).or_default().failure =
+                    Some(ProjectionExpectedFailure {
+                        path: None,
+                        reason: format!("command '{name}' was not published: {reason}"),
+                    });
+            }
+        }
+        true
+    }
+
+    let link_cleanup: [(PathBuf, Option<ProjectionTargetId>); 4] = [
+        (
+            ctx.copilot_skills_target(),
+            Some(ProjectionTargetId::Copilot),
+        ),
+        (ctx.antigravity_root().join("skills"), None),
+        (ctx.shared_skills_target(), None),
+        (ctx.codex_skills_target(), Some(ProjectionTargetId::Codex)),
+    ];
+    for (root, owner) in link_cleanup {
+        if ctx.scope.prune_withheld(
+            DirectDelegationComponent::CommandSkill,
+            COMMANDS_LEGACY_WRITER,
+            &root,
+        ) {
+            continue;
+        }
+        let reserved = ctx.scope.reserved_names(
+            DirectDelegationComponent::CommandSkill,
+            COMMANDS_LEGACY_WRITER,
+            &root,
+        );
+        let keep = keep_names_with(&active_names, &reserved);
+        let step_evidence =
+            prune_stale_command_links(&root, &keep, ctx.opts.dry_run, &registry, owner)
+                .map_err(|e| fault(&evidence, e))?;
+        extend_evidence(&mut evidence, step_evidence);
+        let step_evidence =
+            prune_legacy_ccync_prefixed_dirs(&root, &keep, ctx.opts.dry_run, &registry, owner)
+                .map_err(|e| fault(&evidence, e))?;
+        extend_evidence(&mut evidence, step_evidence);
+    }
+
+    let managed_file_cleanup: [(PathBuf, &str, Option<ProjectionTargetId>); 2] = [
+        (
+            ctx.claude_commands_target(),
+            "md",
+            Some(ProjectionTargetId::Claude),
+        ),
+        (
+            ctx.opencode_commands_target(),
+            "md",
+            Some(ProjectionTargetId::Opencode),
+        ),
+    ];
+    for (root, extension, owner) in managed_file_cleanup {
+        if ctx.scope.prune_withheld(
+            DirectDelegationComponent::Command,
+            COMMANDS_LEGACY_WRITER,
+            &root,
+        ) {
+            continue;
+        }
+        // Managed-file pruning compares file stems, so reserved file names are reduced to stems.
+        let reserved: Vec<String> = ctx
+            .scope
+            .reserved_names(
+                DirectDelegationComponent::Command,
+                COMMANDS_LEGACY_WRITER,
+                &root,
+            )
+            .into_iter()
+            .filter_map(|file| {
+                Path::new(&file)
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        let keep = keep_names_with(&active_names, &reserved);
+        let step_evidence =
+            prune_stale_managed_files(&root, extension, &keep, ctx.opts.dry_run, &registry, owner)
+                .map_err(|e| fault(&evidence, e))?;
+        extend_evidence(&mut evidence, step_evidence);
+    }
+
+    record_step(&mut evidence, None, |block_report| {
+        registry.persist(&installed_source_ids, ctx.opts.dry_run, block_report)
+    })?;
+    Ok(evidence)
+}
+
+/// Canonical personalization producer — attributes each touched/removed path
+/// directly to its owning [`ProjectionTargetId`] at the call site.
+fn update_personalization(
+    ctx: &PersonalizationContext,
+) -> Result<ProjectionEvidence, ProjectionFailure> {
+    let mut evidence = ProjectionEvidence::default();
+
+    ensure_dir(&ctx.ccync_home(), ctx.opts.dry_run).map_err(|e| fault(&evidence, e))?;
+    if ctx.has_agy_target() {
+        ensure_dir(&ctx.gemini_root(), ctx.opts.dry_run).map_err(|e| fault(&evidence, e))?;
+        ensure_dir(&ctx.antigravity_root(), ctx.opts.dry_run).map_err(|e| fault(&evidence, e))?;
+    }
+
+    // D-07/D-08: AGY projection is owned solely by install.rs `AgyProjection`
+    // (see `update_personalization`'s own equivalent note).
+
+    // Workspace-owned bookkeeping — not owned by one runtime target.
+    record_step(&mut evidence, None, |block_report| {
+        let workspace_rule_file = ctx.workspace_rules_target().join("ccync.md");
+        if workspace_rule_file.exists() {
+            if !is_ccync_managed_file(&workspace_rule_file) {
+                block_report.warnings.push(ProjectionWarning {
+                    message: format!(
+                        "preserved user-owned repo rule: {}",
+                        workspace_rule_file.display()
+                    ),
+                });
+            } else {
+                remove_file_if_present(&workspace_rule_file, ctx.opts.dry_run, block_report)?;
+            }
+        }
+        for dir in [
+            ctx.workspace_skills_target(),
+            ctx.workspace_rules_target(),
+            ctx.workspace_agents_root(),
+        ] {
+            remove_empty_dir_if_present(&dir, ctx.opts.dry_run, block_report)?;
+        }
+        Ok(())
+    })?;
+
+    // VS Code skills-bridge settings — owned by Copilot.
+    if !ctx.opts.uninstall && ctx.has_target("copilot") {
+        record_step(
+            &mut evidence,
+            Some(ProjectionTargetId::Copilot),
+            |block_report| {
+                if let Some(mut settings) =
+                    read_json_map_or_warn(&ctx.vscode_settings_file(), block_report)?
+                {
+                    set_vscode_skills_bridge(&mut settings);
+                    write_json_map_with_report(
+                        &ctx.vscode_settings_file(),
+                        &settings,
+                        ctx.opts.dry_run,
+                        block_report,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+    }
+
+    // D-08: the dead source-repo workflow tail is removed (see
+    // `update_personalization`'s own equivalent note) — nothing to mirror here.
+    Ok(evidence)
+}
+
+/// Acceptance probe: `selected_projection_targets_from_config`'s
+/// canonical-set fallback is scoped to [`LegacyState::Absent`] only — a
+/// present-but-all-invalid selection must resolve to empty, not to every
+/// canonical target.
+#[cfg(test)]
+mod projection_target_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn absent_selection_falls_back_to_canonical_set() {
+        let config = CcyncConfig::default();
+        let selected = selected_projection_targets_from_config(&config);
+
+        let mut expected: Vec<String> = CANONICAL_PROJECTION_TARGETS
+            .iter()
+            .map(|target| target.as_str().to_string())
+            .collect();
+        expected.sort();
+        expected.dedup();
+
+        assert_eq!(selected, expected);
+    }
+
+    #[test]
+    fn all_invalid_selection_resolves_to_empty_not_canonical_fallback() {
+        let mut config = CcyncConfig::default();
+        config.selected_projection_targets =
+            vec!["not-a-real-target".to_string(), "also-bogus".to_string()];
+
+        let resolution = config.resolve_projection_targets();
+        assert_eq!(resolution.state, LegacyState::Canonical);
+        assert!(resolution.targets.is_empty());
+
+        let selected = selected_projection_targets_from_config(&config);
+        assert!(
+            selected.is_empty(),
+            "present-but-all-invalid selection must resolve to empty, got {selected:?}"
+        );
+    }
+
+    #[test]
+    fn valid_selection_passes_through_without_canonical_fallback() {
+        let mut config = CcyncConfig::default();
+        config.selected_projection_targets = vec!["claude".to_string(), "codex".to_string()];
+
+        let selected = selected_projection_targets_from_config(&config);
+        assert_eq!(selected, vec!["claude".to_string(), "codex".to_string()]);
+    }
+}

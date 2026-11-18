@@ -1,0 +1,16 @@
+# Static-link the C runtime for Windows MSVC targets.
+#
+# Rationale: the default MSVC toolchain dynamically links VCRUNTIME140.dll (plus
+# the UCRT api-ms-win-crt-* shims). The winget validation sandbox has no VC++
+# Redistributable, so a dynamically-linked ccync.exe fails to load with
+# STATUS_DLL_NOT_FOUND (0xC0000135) — the Validation-Executable-Error that blocked
+# microsoft/winget-pkgs#392515. Static linking folds the CRT into the binary so it
+# runs on a clean Windows install with only universal system DLLs.
+#
+# Applies to both x86_64-pc-windows-msvc and aarch64-pc-windows-msvc via the cfg.
+# CI must NOT set a RUSTFLAGS env var — env RUSTFLAGS *replaces* (does not append
+# to) these rustflags and would silently drop crt-static.
+[target.'cfg(target_os = "windows")']
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]

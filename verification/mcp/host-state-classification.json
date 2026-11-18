@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "command_class": "direct-executable",
+  "cwd_class": "isolated-project",
+  "entry_version": "1",
+  "hosts": {
+    "claude": {
+      "hostVersion": {
+        "output": "2.1.322 (Claude Code)\n",
+        "command": "claude --version",
+        "exitCode": 0,
+        "sha256": "b5f3d62824ffd02d9e9ca8786868f4d1233d78a68a199d8e91d3cd3a9a11b4f7",
+        "identity": "C:\\Users\\leetz\\AppData\\Roaming\\npm\\claude.ps1"
+      },
+      "allowedVolatile": [],
+      "excludedEphemeral": [],
+      "stopSettings": null,
+      "loadConfirmation": {
+        "command": "claude mcp list",
+        "exitCode": 0,
+        "zeroServers": true,
+        "isolation": "fresh isolated profile",
+        "source": "capabilities bootstrap.json"
+      },
+      "actualLoadPath": null,
+      "loadedPathEqualsLiveTarget": null,
+      "credentialLocation": null,
+      "gaps": [
+        "stopSettings: no sourced key list for claude 2.1.322 (Claude Code); native stop verification must supply it.",
+        "actualLoadPath: Native load not run; native load verification must supply it.",
+        "loadedPathEqualsLiveTarget: Native load not run; native load verification must compare it.",
+        "credentialLocation: no sourced location class for this installation; credential location research must supply it."
+      ]
+    },
+    "codex": {
+      "hostVersion": {
+        "output": "codex-cli 0.167.1\n",
+        "command": "codex --version",
+        "exitCode": 0,
+        "sha256": "0c149db80ed0bf442c810146b0ad0163b74982fe4542d673f56c354d7b8229cb",
+        "identity": "C:\\Users\\leetz\\AppData\\Roaming\\npm\\codex.ps1"
+      },
+      "allowedVolatile": [],
+      "excludedEphemeral": [],
+      "stopSettings": null,
+      "loadConfirmation": {
+        "command": "codex mcp list",
+        "exitCode": 0,
+        "zeroServers": true,
+        "isolation": "fresh isolated profile",
+        "source": "capabilities bootstrap.json"
+      },
+      "actualLoadPath": null,
+      "loadedPathEqualsLiveTarget": null,
+      "credentialLocation": {
+        "location": ".codex/auth.json",
+        "source": "https://github.com/openai/codex/blob/main/codex-rs/core/config.schema.json"
+      },
+      "gaps": [
+        "stopSettings: no sourced key list for codex codex-cli 0.167.1; native stop verification must supply it.",
+        "actualLoadPath: Native load not run; native load verification must supply it.",
+        "loadedPathEqualsLiveTarget: Native load not run; native load verification must compare it.",
+        "Provisioning guard, SQLite maintenance lock, app-server control socket, app-server daemon socket, thread-writer locks and tmp arg0 held locks not observed and not excluded."
+      ]
+    },
+    "copilot": {
+      "hostVersion": {
+        "output": "GitHub Copilot CLI 1.0.109.\nRun 'copilot update' to check for updates.\n",
+        "command": "copilot --version",
+        "exitCode": 0,
+        "sha256": "83967cd5f12ac86df19b816e6595d997bc4479fa56f1822a4f776894affa2d0a",
+        "identity": "C:\\Users\\leetz\\AppData\\Local\\Microsoft\\WinGet\\Packages\\GitHub.Copilot_Microsoft.Winget.Source_8wekyb3d8bbwe\\copilot.exe"
+      },
+      "allowedVolatile": [],
+      "excludedEphemeral": [],
+      "stopSettings": null,
+      "loadConfirmation": null,
+      "actualLoadPath": null,
+      "loadedPathEqualsLiveTarget": null,
+      "credentialLocation": {
+        "location": "os-credential-store",
+        "source": "https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli"
+      },
+      "gaps": [
+        "stopSettings: no sourced key list for copilot GitHub Copilot CLI 1.0.109.; native stop verification must supply it.",
+        "actualLoadPath: Native load not run; native load verification must supply it.",
+        "loadedPathEqualsLiveTarget: Native load not run; native load verification must compare it.",
+        "loadConfirmation: no verified noninteractive read-only MCP listing; capability discovery must supply it."
+      ]
+    },
+    "opencode": {
+      "hostVersion": {
+        "output": "opencode v2.2.7\n",
+        "command": "opencode --version",
+        "exitCode": 0,
+        "sha256": "8bb2826bdc75829af78abb2604a12d0ca1779de9c2f2848b526b38802f80c5b0",
+        "identity": "C:\\Users\\leetz\\.bun\\bin\\opencode.exe"
+      },
+      "allowedVolatile": [],
+      "excludedEphemeral": [],
+      "stopSettings": null,
+      "loadConfirmation": {
+        "command": "opencode mcp list",
+        "exitCode": 0,
+        "zeroServers": true,
+        "isolation": "fresh isolated profile",
+        "source": "capabilities bootstrap.json"
+      },
+      "actualLoadPath": null,
+      "loadedPathEqualsLiveTarget": null,
+      "credentialLocation": null,
+      "gaps": [
+        "stopSettings: no sourced key list for opencode opencode v2.2.7; native stop verification must supply it.",
+        "actualLoadPath: Native load not run; native load verification must supply it.",
+        "loadedPathEqualsLiveTarget: Native load not run; native load verification must compare it.",
+        "credentialLocation: no sourced location class for this installation; credential location research must supply it.",
+        "Default load path with XDG_CONFIG_HOME and overrides cleared is unverified; native load verification must test it."
+      ]
+    },
+    "agy": {
+      "hostVersion": {
+        "output": "1.5.6\n",
+        "command": "agy --version",
+        "exitCode": 0,
+        "sha256": "1db38dca719bc26743853d28c03b5acd99e617d0bd513ad3956b571756f0f3a9",
+        "identity": "C:\\Users\\leetz\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Google.AntigravityCLI_Microsoft.Winget.Source_8wekyb3d8bbwe\\agy.exe"
+      },
+      "allowedVolatile": [],
+      "excludedEphemeral": [],
+      "stopSettings": null,
+      "loadConfirmation": null,
+      "actualLoadPath": null,
+      "loadedPathEqualsLiveTarget": null,
+      "credentialLocation": {
+        "location": "os-credential-store",
+        "source": "https://www.agy.dev/docs/install?tab=cli"
+      },
+      "gaps": [
+        "stopSettings: no sourced key list for agy 1.5.6; native stop verification must supply it.",
+        "actualLoadPath: Native load not run; native load verification must supply it.",
+        "loadedPathEqualsLiveTarget: Native load not run; native load verification must compare it.",
+        "loadConfirmation: no verified noninteractive read-only MCP listing; capability discovery must supply it."
+      ]
+    }
+  }
+}

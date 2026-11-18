@@ -1,0 +1,181 @@
+name: Release build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Build matrix ─────────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            platform: windows
+            arch: x64
+            binary_ext: .exe
+            archive_ext: .zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            platform: windows
+            arch: arm64
+            binary_ext: .exe
+            archive_ext: .zip
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            platform: darwin
+            arch: x64
+            binary_ext: ""
+            archive_ext: .tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            platform: darwin
+            arch: arm64
+            binary_ext: ""
+            archive_ext: .tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            platform: linux
+            arch: x64
+            binary_ext: ""
+            archive_ext: .tar.gz
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            platform: linux
+            arch: arm64
+            binary_ext: ""
+            archive_ext: .tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (musl targets)
+        if: contains(matrix.target, 'musl')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build binary (native)
+        if: "!contains(matrix.target, 'musl')"
+        run: cargo build --release --target ${{ matrix.target }} -p ccync-cli
+
+      - name: Build binary (cross/musl)
+        if: contains(matrix.target, 'musl')
+        run: cross build --release --target ${{ matrix.target }} -p ccync-cli
+
+      - name: Prepare canonical asset names
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          BINARY_NAME="ccync-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.binary_ext }}"
+          ARCHIVE_NAME="ccync-${VERSION}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.archive_ext }}"
+          echo "BINARY_NAME=${BINARY_NAME}" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Copy and rename standalone binary asset
+        shell: bash
+        run: |
+          SRC="target/${{ matrix.target }}/release/ccync${{ matrix.binary_ext }}"
+          cp "${SRC}" "${BINARY_NAME}"
+
+      # ccync 0.1.0 shipped a Windows binary that launched into
+      # 0xC0000135 STATUS_DLL_NOT_FOUND on machines without the VC++
+      # redistributable, because the release build dynamically linked the
+      # MSVC C runtime. Assert statically-linked CRT on every Windows MSVC
+      # target so that regression can never reach a tagged release again.
+      # dumpbin.exe ships with the VS Build Tools, not on PATH by default,
+      # so it is located through vswhere.exe (the documented way to find a
+      # VS installation) rather than hardcoding a version-specific path.
+      - name: Assert static CRT linkage (Windows MSVC targets)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            Write-Error "vswhere.exe not found at expected path: $vswhere"
+            exit 1
+          }
+
+          $vsInstallPath = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsInstallPath) {
+            Write-Error "vswhere found no VS installation with the VC.Tools.x86.x64 component"
+            exit 1
+          }
+
+          $dumpbin = Get-ChildItem -Path "$vsInstallPath\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like '*Hostx64\x64*' } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) {
+            Write-Error "dumpbin.exe not found under $vsInstallPath\VC\Tools\MSVC"
+            exit 1
+          }
+
+          $imports = & $dumpbin /imports $env:BINARY_NAME
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "dumpbin /imports failed against $env:BINARY_NAME"
+            exit 1
+          }
+
+          $offender = $imports | Select-String -Pattern 'VCRUNTIME140|api-ms-win-crt'
+          if ($offender) {
+            Write-Error "Dynamic MSVC CRT dependency detected in $env:BINARY_NAME — this is the ccync 0.1.0 0xC0000135 STATUS_DLL_NOT_FOUND regression. Build must statically link the CRT (target-feature=+crt-static):`n$offender"
+            exit 1
+          }
+
+      # ccync ships a SINGLE self-contained binary. It bakes its catalog into the
+      # binary (embedded_catalog_json) and renders its canonical root at runtime
+      # from cloned/added plugins — it does NOT need a packaged source tree (unlike
+      # source-root-resolving CLIs). So the end-user archive is binary-only:
+      # the `ccync` binary plus LICENSE, nothing else.
+      - name: Stage end-user package (binary-only)
+        shell: bash
+        run: |
+          rm -rf pkg && mkdir -p pkg
+          cp "${BINARY_NAME}" "pkg/ccync${{ matrix.binary_ext }}"
+          cp LICENSE pkg/
+
+      - name: Create package archive (zip — Windows)
+        if: matrix.archive_ext == '.zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "pkg/*" -DestinationPath $env:ARCHIVE_NAME
+
+      - name: Create package archive (tar.gz — Unix)
+        if: matrix.archive_ext == '.tar.gz'
+        shell: bash
+        run: |
+          tar -czf "${ARCHIVE_NAME}" -C pkg .
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ env.BINARY_NAME }}
+          if-no-files-found: error
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ env.ARCHIVE_NAME }}
+          if-no-files-found: error
+

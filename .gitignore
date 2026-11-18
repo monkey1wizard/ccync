@@ -1,0 +1,43 @@
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+.venv/
+
+# Local workflow state.
+# Track durable, repo-visible execution memory; ignore the rest.
+.dev/*
+!.dev/project.md
+!.dev/state.md
+!.dev/release.md
+!.dev/plans/
+!.dev/research/
+
+# Private notes (never commit — local-only)
+*.private.md
+
+# Secrets (never commit these)
+*.key
+*.pem
+
+# Local temporary outputs, caches, and sandboxes
+.tmp/
+
+# graphify knowledge-graph outputs (tool default root dir)
+graphify-out/
+
+# rtk (token-proxy CLI) local history db, written into the working dir
+rtk/
+
+# Rust build output
+/target/
+**/target/
+
+.codegraph
+.playwright-mcp

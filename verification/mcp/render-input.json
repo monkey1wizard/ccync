@@ -1,0 +1,18 @@
+{
+  "servers": {
+    "ccync-t12-fault": {
+      "type": "stdio",
+      "command": "C:\\ccync-verification\\absent\\missing-server.exe",
+      "args": []
+    },
+    "ccync-t13-probe": {
+      "type": "stdio",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-File",
+        "verification/mcp/TestServer.ps1"
+      ]
+    }
+  }
+}

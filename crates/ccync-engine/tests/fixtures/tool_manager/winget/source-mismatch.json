@@ -1,0 +1,1 @@
+{"$schema":"https://aka.ms/winget-packages.schema.2.0.json","Sources":[{"SourceDetails":{"Name":"winget","Argument":"https://cdn.winget.microsoft.com/cache"},"Packages":[{"PackageIdentifier":"Contoso.Example","Version":"2.0","Source":"msstore","PackageName":"Example Tool"}]}]}
